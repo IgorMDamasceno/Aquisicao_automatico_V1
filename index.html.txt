@@ -3118,10 +3118,10 @@ function todayIso(){
         }
 
         var routeRows = (preview.rows || []).map(function(row){
-          return '<tr class="border-t border-slate-700/60"><td class="py-2 px-2 mono text-xs">'+escapeHtml(row.url||'')+'</td><td class="py-2 px-2 text-right">'+pct(row.percentualAtual||0,2)+'</td></tr>';
+          return '<tr class="border-t border-slate-700/60"><td class="py-2 px-2 mono text-xs">'+escapeHtml(row.url||'')+'</td><td class="py-2 px-2">'+escapeHtml(row.pagina||'—')+'</td><td class="py-2 px-2 text-right">'+pct(row.percentualAtual||0,2)+'</td><td class="py-2 px-2 text-right">'+money(row.cpcCorrigido||0,3)+'</td></tr>';
         }).join('');
 
-        if (!routeRows) routeRows = '<tr><td class="py-2 px-2 text-slate-400" colspan="2">Nenhuma URL retornada pela API de rotas.</td></tr>';
+        if (!routeRows) routeRows = '<tr><td class="py-2 px-2 text-slate-400" colspan="4">Nenhuma URL retornada pela API de rotas.</td></tr>';
 
         target.innerHTML = '<div class="card rounded-2xl p-4">'
           + '<div class="flex items-center justify-between">'
@@ -3129,7 +3129,7 @@ function todayIso(){
           + '<span class="text-xs text-slate-400">URLs coletadas da API de rotas</span>'
           + '</div>'
           + '<div class="overflow-auto mt-3">'
-          + '<table class="w-full text-sm"><thead class="text-slate-400"><tr><th class="text-left py-2 px-2">URL</th><th class="text-right py-2 px-2">% tráfego atual</th></tr></thead><tbody>' + routeRows + '</tbody></table>'
+          + '<table class="w-full text-sm"><thead class="text-slate-400"><tr><th class="text-left py-2 px-2">URL</th><th class="text-left py-2 px-2">Página de Queda</th><th class="text-right py-2 px-2">% tráfego atual</th><th class="text-right py-2 px-2">CPC Corrigido</th></tr></thead><tbody>' + routeRows + '</tbody></table>'
           + '</div>'
           + '</div>';
       }).withFailureHandler(function(err){
@@ -3137,7 +3137,7 @@ function todayIso(){
         if (!target) return;
         var message = err && err.message ? err.message : 'Falha ao carregar URLs da API de rotas.';
         target.innerHTML = '<div class="card rounded-2xl p-6 text-slate-400">'+escapeHtml(message)+'</div>';
-      }).getRouteUrlsPreview({ operacao: selectedOp, suboperacao: selectedSub });
+      }).getRouteUrlsPreview({ operacao: selectedOp, suboperacao: selectedSub, pessoa: (filters && filters.pessoa) || (FILTRO_PESSOA && FILTRO_PESSOA.selected ? FILTRO_PESSOA.selected : ''), startDate: (filters && filters.startDate) || (byId('f-start') ? byId('f-start').value : ''), endDate: (filters && filters.endDate) || (byId('f-end') ? byId('f-end').value : '') });
 
       if (!selectedOp || !selectedSub) {
         if (historyTb) historyTb.innerHTML = '<tr><td class="text-slate-400">Selecione Operação e Suboperação para consultar o histórico.</td></tr>';
