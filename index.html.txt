@@ -3137,7 +3137,7 @@ function todayIso(){
         if (!target) return;
         var message = err && err.message ? err.message : 'Falha ao carregar URLs da API de rotas.';
         target.innerHTML = '<div class="card rounded-2xl p-6 text-slate-400">'+escapeHtml(message)+'</div>';
-      }).getRouteUrlsPreview({ operacao: selectedOp, suboperacao: selectedSub, pessoa: (filters && filters.pessoa) || (FILTRO_PESSOA && FILTRO_PESSOA.selected ? FILTRO_PESSOA.selected : ''), startDate: (filters && filters.startDate) || (byId('f-start') ? byId('f-start').value : ''), endDate: (filters && filters.endDate) || (byId('f-end') ? byId('f-end').value : '') });
+      }).getRouteUrlsPreview({ operacao: selectedOp, suboperacao: selectedSub, pessoa: (filters && filters.pessoa) || (FILTRO_PESSOA && FILTRO_PESSOA.selected ? FILTRO_PESSOA.selected : ''), paginasSelecionadas: (filters && filters.paginasSelecionadas && filters.paginasSelecionadas.slice) ? filters.paginasSelecionadas.slice() : (PQ && PQ.selected ? PQ.selected.slice() : []), startDate: (filters && filters.startDate) || (byId('f-start') ? byId('f-start').value : ''), endDate: (filters && filters.endDate) || (byId('f-end') ? byId('f-end').value : ''), granularity: (filters && filters.granularity) || (byId('f-gran') ? byId('f-gran').value : 'hour') });
 
       if (!selectedOp || !selectedSub) {
         if (historyTb) historyTb.innerHTML = '<tr><td class="text-slate-400">Selecione Operação e Suboperação para consultar o histórico.</td></tr>';

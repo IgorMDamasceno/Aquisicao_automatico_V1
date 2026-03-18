@@ -1152,15 +1152,6 @@ function getRouteUrlsPreview(params) {
     return isNaN(n) ? 0 : n;
   }
 
-  function blankAgg_() { return { impressions: 0, clicks: 0, revenue: 0, requests: 0 }; }
-
-  function pushRow_(agg, row, col) {
-    agg.impressions += toNumber_(row[col.impr]);
-    agg.clicks += toNumber_(row[col.clicks]);
-    agg.revenue += toNumber_(row[col.revenue]);
-    agg.requests += toNumber_(row[col.req]);
-  }
-
   var requestedPessoa = String(params.pessoa || '').trim();
   var requestedOp = String(params.operacao || '').trim();
   var requestedSub = String(params.suboperacao || '').trim();
@@ -1205,14 +1196,12 @@ function getRouteUrlsPreview(params) {
   });
 
   var urlToPage = {};
-  var pageIndex = {};
+  var pagesSet = {};
   cfgRows.forEach(function(entry){
     var pageName = String(entry.pagina || '').trim();
     var parteName = String(entry.parte || '').trim().toUpperCase();
     if (!pageName || !parteName) return;
-
-    if (!pageIndex[pageName]) pageIndex[pageName] = {};
-    pageIndex[pageName][parteName] = { canal: entry.canal || '', urls: entry.urls || [] };
+    pagesSet[pageName] = true;
 
     if (parteName === 'P1') {
       (entry.urls || []).forEach(function(u){
@@ -1235,76 +1224,30 @@ function getRouteUrlsPreview(params) {
     startDate = endDate;
   }
 
-  var baseSh = getBaseSheet_();
-  var data = baseSh.getDataRange().getValues();
-  var headers = data[0] || [];
-  var idx = getHeaderIndexMap_(headers);
-  var col = {
-    date: idx[HEADER_MAP.date],
-    channel: idx[HEADER_MAP.channel],
-    url: idx[HEADER_MAP.url],
-    adunit: idx[HEADER_MAP.adunit],
-    impr: idx[HEADER_MAP.impressions],
-    clicks: idx[HEADER_MAP.clicks],
-    revenue: idx[HEADER_MAP.revenue],
-    req: idx[HEADER_MAP.requests]
-  };
-
-  var minDate = startDate ? parseDate_(startDate) : null;
-  var maxDate = endDate ? parseDate_(endDate) : null;
-
-  function rowDateOk_(row) {
-    var d = parseDate_(row[col.date]);
-    if (!d) return false;
-    if (minDate && d < minDate) return false;
-    if (maxDate && d > maxDate) return false;
-    return true;
-  }
-
-  function matchParte_(row, parteCfg) {
-    if (!parteCfg) return false;
-    var rowCanal = String(row[col.channel] || '').trim().toLowerCase();
-    var cfgCanal = String(parteCfg.canal || '').trim().toLowerCase();
-    var canalOk = !cfgCanal || rowCanal === cfgCanal;
-    var rowUrl = normUrlStrict_(row[col.url] || '');
-    return canalOk && (!parteCfg.urls.length || parteCfg.urls.some(function(u){ return rowUrl === u; }));
-  }
-
-  var aggByPageParte = {};
-  var p1InterstitialReqByPage = {};
-  data.slice(1).forEach(function(row){
-    if (!rowDateOk_(row)) return;
-    Object.keys(pageIndex).forEach(function(pageName){
-      ['P1', 'P2'].forEach(function(parteName){
-        var parteCfg = pageIndex[pageName][parteName];
-        if (!matchParte_(row, parteCfg)) return;
-
-        var key = pageName + '||' + parteName;
-        if (!aggByPageParte[key]) aggByPageParte[key] = blankAgg_();
-        pushRow_(aggByPageParte[key], row, col);
-
-        if (parteName === 'P1') {
-          var adunit = String(row[col.adunit] || '').toLowerCase();
-          if (adunit.indexOf('mob_interstitial') !== -1 || adunit.indexOf('mobile_interstitial') !== -1) {
-            if (!p1InterstitialReqByPage[pageName]) p1InterstitialReqByPage[pageName] = 0;
-            p1InterstitialReqByPage[pageName] += toNumber_(row[col.req]);
-          }
-        }
-      });
-    });
-  });
-
   var cpcCorrigidoByPage = {};
-  Object.keys(pageIndex).forEach(function(pageName){
-    var p1 = aggByPageParte[pageName + '||P1'] || blankAgg_();
-    var p2 = aggByPageParte[pageName + '||P2'] || blankAgg_();
-    var reqInt = p1InterstitialReqByPage[pageName] || 0;
-    var revenueP1P2 = (p1.revenue || 0) + (p2.revenue || 0);
-    var clicksP1P2 = (p1.clicks || 0) + (p2.clicks || 0);
-    var cpcP1P2 = clicksP1P2 > 0 ? (revenueP1P2 / clicksP1P2) : 0;
-    var interactionRate = reqInt > 0 ? (clicksP1P2 / reqInt) * 100 : 0;
-    var interactionRateCapped = Math.max(0, Math.min(interactionRate, 100));
-    cpcCorrigidoByPage[pageName] = cpcP1P2 * (interactionRateCapped / 100);
+  var selectedPages = [];
+  if (params.paginasSelecionadas && params.paginasSelecionadas.length) {
+    selectedPages = params.paginasSelecionadas.map(function(p){ return String(p || '').trim(); }).filter(Boolean);
+  }
+  if (!selectedPages.length) selectedPages = Object.keys(pagesSet);
+
+  if (requestedPessoa && selectedPages.length) {
+    var compare = (getDashboardData({
+      pessoa: requestedPessoa,
+      operacao: requestedOp,
+      suboperacao: requestedSub,
+      paginasSelecionadas: selectedPages,
+      startDate: startDate,
+      endDate: endDate,
+      granularity: String(params.granularity || 'hour')
+    }).compare || []);
+    compare.forEach(function(row){
+      cpcCorrigidoByPage[String(row.page || '').trim()] = toNumber_(row.cpcCorrigido || 0);
+    });
+  }
+
+  Object.keys(pagesSet).forEach(function(pageName){
+    if (!cpcCorrigidoByPage.hasOwnProperty(pageName)) cpcCorrigidoByPage[pageName] = 0;
   });
 
   var routeResponse = fetchRouteSnapshot_(routeConfig);
