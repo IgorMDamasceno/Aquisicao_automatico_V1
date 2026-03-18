@@ -1349,6 +1349,7 @@ function calculateCpcDistribution(params) {
         operacao: group.operacao,
         suboperacao: group.suboperacao,
         urlP1: url,
+        inRouteApi: !!routeUrlsSet[url],
         pagina: pageName,
         requests: m.requests,
         revenue: m.revenue,
