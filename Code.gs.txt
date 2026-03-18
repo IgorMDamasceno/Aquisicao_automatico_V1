@@ -1239,7 +1239,7 @@ function getRouteUrlsPreview(params) {
       paginasSelecionadas: selectedPages,
       startDate: startDate,
       endDate: endDate,
-      granularity: String(params.granularity || 'hour')
+      granularity: 'last3h'
     }).compare || []);
     compare.forEach(function(row){
       cpcCorrigidoByPage[String(row.page || '').trim()] = toNumber_(row.cpcCorrigido || 0);
@@ -1467,6 +1467,8 @@ function calculateCpcDistribution(params) {
   var headers = data[0] || [];
   var idx = getHeaderIndexMap_(headers);
   var col = {
+    date: idx[HEADER_MAP.date],
+    hour: idx[HEADER_MAP.hour],
     url: idx[HEADER_MAP.url],
     impressions: idx[HEADER_MAP.impressions],
     clicks: idx[HEADER_MAP.clicks],
@@ -1475,7 +1477,25 @@ function calculateCpcDistribution(params) {
     coverage: idx[HEADER_MAP.coverage]
   };
 
+  var maxHourMs = 0;
   data.slice(1).forEach(function(row){
+    var d = parseDate_(row[col.date]);
+    if (!d) return;
+    var h = parseInt(row[col.hour], 10) || 0;
+    var ms = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0).getTime();
+    if (ms > maxHourMs) maxHourMs = ms;
+  });
+  var cutoffMs = maxHourMs > 0 ? (maxHourMs - (3 * 60 * 60 * 1000)) : null;
+
+  data.slice(1).forEach(function(row){
+    if (cutoffMs != null) {
+      var d = parseDate_(row[col.date]);
+      if (!d) return;
+      var h = parseInt(row[col.hour], 10) || 0;
+      var ms = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0).getTime();
+      if (ms < cutoffMs) return;
+    }
+
     var normalizedUrl = normUrlStrict_(row[col.url] || '');
     if (!normalizedUrl) return;
     Object.keys(pageMetricsByGroup).forEach(function(groupKey){
