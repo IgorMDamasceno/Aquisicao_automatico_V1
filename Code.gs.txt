@@ -1250,6 +1250,20 @@ function getRouteUrlsPreview(params) {
     if (!cpcCorrigidoByPage.hasOwnProperty(pageName)) cpcCorrigidoByPage[pageName] = 0;
   });
 
+  var suggestedByUrl = {};
+  var distPreview = calculateCpcDistribution({ operacao: requestedOp, suboperacao: requestedSub });
+  var distGroups = (distPreview && distPreview.groups) ? distPreview.groups : [];
+  distGroups.forEach(function(group){
+    (group.urls || []).forEach(function(item){
+      var normalizedUrl = normUrlStrict_(item.urlP1 || '');
+      if (!normalizedUrl) return;
+      suggestedByUrl[normalizedUrl] = {
+        percentualSugerido: toNumber_(item.percentualSugerido || 0),
+        eligible: !!item.eligible
+      };
+    });
+  });
+
   var routeResponse = fetchRouteSnapshot_(routeConfig);
   if (!routeResponse || !routeResponse.ok) {
     return {
@@ -1272,11 +1286,14 @@ function getRouteUrlsPreview(params) {
     if (!normalized) return null;
     var pageName = urlToPage[normalized] || '';
     var cpcCorrigido = pageName ? (cpcCorrigidoByPage[pageName] || 0) : 0;
+    var suggested = suggestedByUrl[normalized] || { percentualSugerido: 0, eligible: false };
     return {
       url: normalized,
       percentualAtual: parseRoutePercent_(link.percentage || link.percentual || 0),
       pagina: pageName,
-      cpcCorrigido: cpcCorrigido
+      cpcCorrigido: cpcCorrigido,
+      percentualSugerido: suggested.eligible ? suggested.percentualSugerido : 0,
+      eligible: suggested.eligible
     };
   }).filter(function(row){ return !!row; });
 
