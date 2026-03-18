@@ -1134,6 +1134,86 @@ function listOperationsSuboperations() {
   return { operations: operations };
 }
 
+function getRouteUrlsPreview(params) {
+  params = params || {};
+
+  function normText_(value) {
+    return String(value || '').trim().toLowerCase();
+  }
+
+  var requestedOp = String(params.operacao || '').trim();
+  var requestedSub = String(params.suboperacao || '').trim();
+  if (!requestedOp || !requestedSub) {
+    return { ok: false, message: 'Selecione Operação e Suboperação para carregar URLs da rota.', rows: [], diagnostics: { operacao: requestedOp, suboperacao: requestedSub } };
+  }
+
+  var requestedOpNorm = normText_(requestedOp);
+  var requestedSubNorm = normText_(requestedSub);
+  var routeConfig = null;
+  (listRouteApiConfigs() || []).some(function(rc){
+    var sameOp = normText_(rc.operacao) === requestedOpNorm;
+    var sameSub = normText_(rc.suboperacao) === requestedSubNorm;
+    if (!sameOp || !sameSub) return false;
+    routeConfig = rc;
+    return true;
+  });
+
+  if (!routeConfig) {
+    return {
+      ok: false,
+      message: 'Não existe configuração de rota salva para esta Operação/Suboperação.',
+      rows: [],
+      diagnostics: { operacao: requestedOp, suboperacao: requestedSub, routeConfigFound: false }
+    };
+  }
+
+  if (!routeConfig.empresaId || !routeConfig.dominioId || !routeConfig.slugRota) {
+    return {
+      ok: false,
+      message: 'Configuração de rota incompleta (Empresa ID, Domínio ID ou Slug).',
+      rows: [],
+      diagnostics: { operacao: requestedOp, suboperacao: requestedSub, routeConfigFound: true }
+    };
+  }
+
+  var routeResponse = fetchRouteSnapshot_(routeConfig);
+  if (!routeResponse || !routeResponse.ok) {
+    return {
+      ok: false,
+      message: 'Falha ao consultar a API de rotas.',
+      rows: [],
+      diagnostics: {
+        operacao: requestedOp,
+        suboperacao: requestedSub,
+        routeConfigFound: true,
+        httpCode: routeResponse ? routeResponse.code : 0,
+        routeResponseOk: !!(routeResponse && routeResponse.ok)
+      }
+    };
+  }
+
+  var routeLinks = (((routeResponse.body || {}).data || {}).links || []);
+  var rows = routeLinks.map(function(link){
+    var normalized = normUrlStrict_(link.url || link.link || link.destination_url || '');
+    return {
+      url: normalized,
+      percentualAtual: toNumber_(link.percentage || link.percentual || 0)
+    };
+  }).filter(function(row){ return !!row.url; });
+
+  return {
+    ok: true,
+    message: rows.length ? '' : 'A API respondeu, mas não retornou links para esta rota.',
+    rows: rows,
+    diagnostics: {
+      operacao: requestedOp,
+      suboperacao: requestedSub,
+      routeConfigFound: true,
+      routeLinksCount: rows.length
+    }
+  };
+}
+
 function calculateCpcDistribution(params) {
   params = params || {};
 
