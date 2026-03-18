@@ -1,0 +1,1726 @@
+// Code.gs
+
+const CONFIG_SHEET = 'Config - Operações';
+const PRICING_SHEET_ADSELETO = 'Precificação - AdSeleto';
+const PRICING_SHEET_IGOAL = 'Precificação - Igoal';
+const BASE_SHEET_CANDIDATES = ['Base de Dados','Base de Dados - Exemplo','BD - GAM','BD - GAM1'];
+const PART_ORDER = ['Quiz','P1','P2'];
+const HEADER_MAP = {
+  date: 'Data',
+  hour: 'Hora',
+  channel: 'Canal',
+  url: 'URL',
+  adunit: 'Bloco de Anúncio',
+  impressions: 'Impressões',
+  clicks: 'Cliques',
+  ctr: 'CTR',
+  revenue: 'Receita (USD)',
+  ecpm: 'eCPM',
+  requests: 'Solicitação AD',
+  coverage: 'Cobertura',
+  cpc: 'CPC',
+  viewability: 'Viewability',
+};
+const CONFIG_HEADERS = ['ID','Pessoa','Operação','Suboperação','PaginaQueda','Parte','Canal','URLs (;)','Rede','Moeda'];
+
+function doGet() {
+  return HtmlService.createTemplateFromFile('index')
+    .evaluate()
+    .setTitle('Dashboard de Operações')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/* ==== helpers de planilha ==== */
+function getBaseSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  for (var i=0;i<BASE_SHEET_CANDIDATES.length;i++) {
+    var name = BASE_SHEET_CANDIDATES[i];
+    var sh = ss.getSheetByName(name);
+    if (sh) return sh;
+  }
+  return ss.getSheets()[0];
+}
+
+function ensureConfigSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(CONFIG_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(CONFIG_SHEET);
+    sh.getRange(1,1,1,CONFIG_HEADERS.length).setValues([CONFIG_HEADERS]);
+    sh.setFrozenRows(1);
+    return sh;
+  }
+
+  var lastCol = sh.getLastColumn();
+  if (lastCol < CONFIG_HEADERS.length) {
+    sh.insertColumnsAfter(lastCol, CONFIG_HEADERS.length - lastCol);
+    lastCol = CONFIG_HEADERS.length;
+  }
+  var currentHeaders = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  var needsUpdate = false;
+  for (var i = 0; i < CONFIG_HEADERS.length; i++) {
+    if (currentHeaders[i] !== CONFIG_HEADERS[i]) {
+      needsUpdate = true;
+      break;
+    }
+  }
+  if (needsUpdate) {
+    sh.getRange(1, 1, 1, CONFIG_HEADERS.length).setValues([CONFIG_HEADERS]);
+  }
+
+  return sh;
+}
+
+function ensurePricingSheetAdSeleto_() {
+  const ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(PRICING_SHEET_ADSELETO);
+  if (!sh) {
+    sh = ss.insertSheet(PRICING_SHEET_ADSELETO);
+    sh.getRange(1, 1, 1, 7).setValues([
+      ['spnprice_id', 'domain_id', 'price_rule', 'utm_source', 'slot_id', 'url', 'Sincronizar']
+    ]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function ensurePricingSheetIgoal_() {
+  const ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(PRICING_SHEET_IGOAL);
+  if (!sh) {
+    sh = ss.insertSheet(PRICING_SHEET_IGOAL);
+    sh.getRange(1, 1, 1, 8).setValues([
+      ['rule_id', 'dominio', 'utm_source', 'url', 'bloco', 'company_id', 'price_rule', 'Sincronizar']
+    ]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function getHeaderIndexMap_(headers) {
+  var map = {};
+  for (var i=0;i<headers.length;i++) map[String(headers[i]).trim()] = i;
+  return map;
+}
+
+/* ==== conversões ==== */
+function toNumber_(val) {
+  if (typeof val === 'number') return val;
+  if (val == null) return 0;
+  var s = String(val).trim();
+  if (!s) return 0;
+  s = s.replace(/\s/g,'').replace(/%/g,'');
+  s = s.replace(/\./g,'').replace(/,/g,'.');
+  var n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+function formatPriceRuleIgoal_(value) {
+  if (value === null || value === undefined) return '';
+  var s = String(value).trim();
+  if (!s) return '';
+  s = s.replace(/,/g, '.');
+  var n = parseFloat(s);
+  if (isNaN(n)) return '';
+  return n.toFixed(2);
+}
+function normUrlStrict_(u) {
+  if (!u) return '';
+  var s = String(u).trim().toLowerCase();
+  s = s.replace(/^https?:\/\//,'');
+  s = s.replace(/^www\./,'');
+  s = s.split('#')[0];
+  s = s.split('?')[0];
+  s = s.replace(/\/+$/,'');
+  return s;
+}
+function parseDate_(v) {
+  if (v instanceof Date) return v;
+  var s = String(v || '').trim();
+  if (!s) return null;
+  var m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return new Date(+m[1], +m[2]-1, +m[3]);
+  m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m) return new Date(+m[3], +m[2]-1, +m[1]);
+  var d = new Date(s);
+  return isNaN(d) ? null : d;
+}
+
+function todayIso_() {
+  var now = new Date();
+  var yyyy = now.getFullYear();
+  var mm = ('0' + (now.getMonth() + 1)).slice(-2);
+  var dd = ('0' + now.getDate()).slice(-2);
+  return yyyy + '-' + mm + '-' + dd;
+}
+
+/* ============= CONFIG ============= */
+function getConfig() {
+  var sh = ensureConfigSheet_();
+  var range = sh.getDataRange().getValues();
+  var headers = range[0] || [];
+  var rows = range.slice(1);
+  var idx = getHeaderIndexMap_(headers);
+  var data = [];
+  rows.forEach(function(r) {
+    var pessoa = String(r[idx['Pessoa']]||'').trim();
+    if (pessoa) {
+      data.push({
+        id: String(r[idx['ID']] || ''),
+        pessoa: pessoa,
+        operacao: String(r[idx['Operação']] || '').trim(),
+        suboperacao: String(r[idx['Suboperação']] || '').trim(),
+        pagina: String(r[idx['PaginaQueda']] || '').trim(),
+        parte: String(r[idx['Parte']] || '').trim(),
+        canal: String(r[idx['Canal']] || '').trim(),
+        urls: String(r[idx['URLs (;)']] || '').split(';').map(normUrlStrict_).filter(Boolean),
+        rede: String(r[idx['Rede']] || '').trim(),
+        moeda: (function(){
+          var moedaIdx = idx['Moeda'];
+          var moedaVal = moedaIdx != null ? String(r[moedaIdx] || '').trim().toUpperCase() : '';
+          return moedaVal || 'USD';
+        })()
+      });
+    }
+  });
+  var pessoasSet = {}, opsByPessoa = {}, subsByOp = {}, paginasByOp = {}, paginasByOpSub = {};
+  data.forEach(function(d) {
+    pessoasSet[d.pessoa] = true;
+    if (!opsByPessoa[d.pessoa]) opsByPessoa[d.pessoa] = {};
+    opsByPessoa[d.pessoa][d.operacao] = true;
+    var keyOp = d.pessoa + '||' + d.operacao;
+    if (!subsByOp[keyOp]) subsByOp[keyOp] = {};
+    if (d.suboperacao) subsByOp[keyOp][d.suboperacao] = true;
+    if (!paginasByOp[keyOp]) paginasByOp[keyOp] = {};
+    paginasByOp[keyOp][d.pagina] = true;
+    var keyOpSub = d.pessoa + '||' + d.operacao + '||' + d.suboperacao;
+    if (!paginasByOpSub[keyOpSub]) paginasByOpSub[keyOpSub] = {};
+    paginasByOpSub[keyOpSub][d.pagina] = true;
+  });
+  var pessoas = Object.keys(pessoasSet).sort();
+  var opsByPessoaObj = {};
+  Object.keys(opsByPessoa).forEach(function(p){ opsByPessoaObj[p] = Object.keys(opsByPessoa[p]).sort(); });
+  var subsByOpObj = {};
+  Object.keys(subsByOp).forEach(function(k){ subsByOpObj[k] = Object.keys(subsByOp[k]).sort(); });
+  var paginasByOpObj = {};
+  Object.keys(paginasByOp).forEach(function(k){ paginasByOpObj[k] = Object.keys(paginasByOp[k]).sort(); });
+  var paginasByOpSubObj = {};
+  Object.keys(paginasByOpSub).forEach(function(k){ paginasByOpSubObj[k] = Object.keys(paginasByOpSub[k]).sort(); });
+
+  return { rows: data, pessoas: pessoas, opsByPessoa: opsByPessoaObj, subsByOp: subsByOpObj, paginasByOp: paginasByOpObj, paginasByOpSub: paginasByOpSubObj };
+}
+
+function upsertConfig(row) {
+  var sh = ensureConfigSheet_();
+  var range = sh.getDataRange().getValues();
+  var headers = range[0] || [];
+  var idx = getHeaderIndexMap_(headers);
+  
+  if (row.id) {
+    for (var i = 1; i < range.length; i++) {
+      if (String(range[i][idx['ID']] || '').trim() === String(row.id).trim()) {
+        var values = [ row.id, row.pessoa, row.operacao, row.suboperacao || '', row.pagina, row.parte, row.canal, row.urls, row.rede, row.moeda || 'USD' ];
+        sh.getRange(i + 1, 1, 1, values.length).setValues([values]);
+        return { ok: true };
+      }
+    }
+  }
+
+  var newValues = [ Utilities.getUuid(), row.pessoa, row.operacao, row.suboperacao || '', row.pagina, row.parte, row.canal, row.urls, row.rede, row.moeda || 'USD' ];
+  sh.appendRow(newValues);
+  return { ok: true };
+}
+
+
+function deleteConfig(id) {
+  var sh = ensureConfigSheet_();
+  var range = sh.getDataRange().getValues();
+  var idx = getHeaderIndexMap_(range[0]);
+  for (var i = 1; i < range.length; i++) {
+    if (String(range[i][idx['ID']] || '') === String(id)) {
+      sh.deleteRow(i + 1);
+      return { ok: true };
+    }
+  }
+  return { ok: false, msg: 'ID não encontrado' };
+}
+
+/* ============= PRECIFICAÇÃO ============= */
+function getPricingRulesAdSeleto_() {
+  var sh = ensurePricingSheetAdSeleto_();
+  var values = sh.getDataRange().getValues();
+  var headers = values.shift() || [];
+  var idx = getHeaderIndexMap_(headers);
+  return values.map(function(row) {
+    return {
+      spnprice_id: row[idx['spnprice_id']],
+      domain_id: row[idx['domain_id']],
+      price_rule: row[idx['price_rule']],
+      utm_source: row[idx['utm_source']],
+      slot_id: row[idx['slot_id']],
+      url: row[idx['url']]
+    };
+  });
+}
+
+function upsertPricingRulesAdSeleto(rules) {
+  if (!rules || !rules.length) {
+    return { ok: false, message: 'Nenhuma regra para salvar.' };
+  }
+  var sh = ensurePricingSheetAdSeleto_();
+  var range = sh.getDataRange();
+  var values = range.getValues();
+  var headers = values[0];
+  var idx = getHeaderIndexMap_(headers);
+  var syncColumnIndex = headers.indexOf('Sincronizar') + 1;
+  if (syncColumnIndex === 0) {
+      throw new Error("A coluna 'Sincronizar' não foi encontrada na aba de precificação.");
+  }
+  
+  var updatedRules = [];
+
+  rules.forEach(function(rule) {
+    if (!rule.spnprice_id) {
+      rule.spnprice_id = new Date().getTime() + Math.floor(Math.random() * 1000);
+      var rowValues = [rule.spnprice_id, rule.domain_id, rule.price_rule, rule.utm_source, rule.slot_id, rule.url, "Sim"];
+      sh.appendRow(rowValues);
+    } else {
+      var found = false;
+      for (var i = 1; i < values.length; i++) {
+        if (String(values[i][idx['spnprice_id']]) === String(rule.spnprice_id)) {
+          var rowValues = [rule.spnprice_id, rule.domain_id, rule.price_rule, rule.utm_source, rule.slot_id, rule.url];
+          sh.getRange(i + 1, 1, 1, rowValues.length).setValues([rowValues]);
+          sh.getRange(i + 1, syncColumnIndex).setValue("Sim");
+          found = true;
+          break;
+        }
+      }
+      if(!found) {
+         var rowValues = [rule.spnprice_id, rule.domain_id, rule.price_rule, rule.utm_source, rule.slot_id, rule.url, "Sim"];
+        sh.appendRow(rowValues);
+      }
+    }
+    updatedRules.push(rule);
+  });
+  
+  return { ok: true, rules: updatedRules };
+}
+
+function getPricingRulesIgoal_() {
+  var sh = ensurePricingSheetIgoal_();
+  var values = sh.getDataRange().getValues();
+  var headers = values.shift() || [];
+  if (!headers.length) return [];
+  var idx = getHeaderIndexMap_(headers);
+  return values.map(function(row) {
+    return {
+      rule_id: row[idx['rule_id']],
+      dominio: row[idx['dominio']],
+      utm_source: row[idx['utm_source']],
+      url: row[idx['url']],
+      bloco: row[idx['bloco']],
+      company_id: row[idx['company_id']],
+      price_rule: formatPriceRuleIgoal_(row[idx['price_rule']])
+    };
+  });
+}
+
+function upsertPricingRulesIgoal(rules) {
+  if (!rules || !rules.length) {
+    return { ok: false, message: 'Nenhuma regra para salvar.' };
+  }
+  var sh = ensurePricingSheetIgoal_();
+  var range = sh.getDataRange();
+  var values = range.getValues();
+  var headers = values[0] || [];
+  var idx = getHeaderIndexMap_(headers);
+  var syncColumnIndex = headers.indexOf('Sincronizar') + 1;
+  if (syncColumnIndex === 0) {
+    throw new Error("A coluna 'Sincronizar' não foi encontrada na aba de precificação da Igoal.");
+  }
+
+  var updatedRules = [];
+
+  rules.forEach(function(rule) {
+    var formattedPrice = formatPriceRuleIgoal_(rule.price_rule);
+    rule.price_rule = formattedPrice;
+
+    if (!rule.rule_id) {
+      rule.rule_id = new Date().getTime() + Math.floor(Math.random() * 1000);
+      var rowValuesNew = [rule.rule_id, rule.dominio, rule.utm_source, rule.url, rule.bloco, rule.company_id, rule.price_rule, 'Sim'];
+      sh.appendRow(rowValuesNew);
+    } else {
+      var found = false;
+      for (var i = 1; i < values.length; i++) {
+        if (String(values[i][idx['rule_id']]) === String(rule.rule_id)) {
+          var rowValues = [rule.rule_id, rule.dominio, rule.utm_source, rule.url, rule.bloco, rule.company_id, rule.price_rule];
+          sh.getRange(i + 1, 1, 1, rowValues.length).setValues([rowValues]);
+          sh.getRange(i + 1, syncColumnIndex).setValue('Sim');
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        var rowValuesAppend = [rule.rule_id, rule.dominio, rule.utm_source, rule.url, rule.bloco, rule.company_id, rule.price_rule, 'Sim'];
+        sh.appendRow(rowValuesAppend);
+      }
+    }
+    updatedRules.push(rule);
+  });
+
+  return { ok: true, rules: updatedRules };
+}
+
+/* ============= DASHBOARD ============= */
+function getDashboardData(params) {
+  params = params || {};
+  var pessoa = params.pessoa, operacao = params.operacao, suboperacao = String(params.suboperacao || '').trim(), paginasSelecionadas = params.paginasSelecionadas || [],
+      startDate = params.startDate, endDate = params.endDate, granularity = params.granularity || 'hour';
+  var gran = (granularity === 'day' || granularity === 'last6h' || granularity === 'last3h') ? granularity : 'hour';
+  var emptyReturn = { pages: [], compare: [], compareBlocks: [], granularity: gran, seriesChart: [], labelsChart: [], seriesChartByBlock: {}, pricingRulesAdSeleto: [], pricingRulesIgoal: [] };
+  if (!pessoa || !operacao || !paginasSelecionadas.length) return emptyReturn;
+
+if (!startDate && !endDate) {
+    var today = todayIso_();
+    startDate = today;
+    endDate = today;
+  } else if (startDate && !endDate) {
+    endDate = startDate;
+  } else if (!startDate && endDate) {
+    startDate = endDate;
+  }
+
+  var cfgAll = getConfig().rows.filter(function(r){
+    if (r.pessoa !== pessoa || r.operacao !== operacao) return false;
+    if (suboperacao && r.suboperacao !== suboperacao) return false;
+    return true;
+  });
+  var pageIndex = {};
+  cfgAll.forEach(r => {
+    if (paginasSelecionadas.includes(r.pagina)) {
+      if (!pageIndex[r.pagina]) pageIndex[r.pagina] = {};
+      pageIndex[r.pagina][r.parte] = { canal: r.canal, urls: r.urls, rede: r.rede, moeda: r.moeda };
+    }
+  });
+  var baseSh = getBaseSheet_();
+  var data = baseSh.getDataRange().getValues();
+  var headers = data[0] || [], idx = getHeaderIndexMap_(headers);
+  var rows = data.slice(1);
+  
+  var col = {
+    date: idx[HEADER_MAP.date], hour: idx[HEADER_MAP.hour], channel: idx[HEADER_MAP.channel], url: idx[HEADER_MAP.url],
+    adunit: idx[HEADER_MAP.adunit], impr: idx[HEADER_MAP.impressions], clicks: idx[HEADER_MAP.clicks], revenue: idx[HEADER_MAP.revenue],
+    req: idx[HEADER_MAP.requests], cov: idx[HEADER_MAP.coverage], view: idx[HEADER_MAP.viewability]
+  };
+  var minDate = startDate ? parseDate_(startDate) : null;
+  var maxDate = endDate ? parseDate_(endDate) : null;
+
+  var cutoffMs = null;
+  var rollingHours = granularity === 'last3h' ? 3 : (granularity === 'last6h' ? 6 : null);
+  if (rollingHours !== null) {
+    let maxMsMatched = 0;
+    rows.forEach(function(row) {
+        var d = parseDate_(row[col.date]);
+        var h = parseInt(row[col.hour], 10) || 0;
+        if(d) {
+            var ms = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0).getTime();
+            if (ms > maxMsMatched) maxMsMatched = ms;
+        }
+    });
+    if (maxMsMatched > 0) cutoffMs = maxMsMatched - (rollingHours * 60 * 60 * 1000);
+  }
+
+  function rowDateOk_(row) {
+    var d = parseDate_(row[col.date]);
+    if (!d) return false;
+    if (rollingHours !== null) {
+        if (cutoffMs === null) return false;
+        var h = parseInt(row[col.hour], 10) || 0;
+        var ms = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0).getTime();
+        return ms >= cutoffMs;
+    }
+    if (minDate && d < minDate) return false;
+    if (maxDate && d > maxDate) return false;
+    return true;
+  }
+
+  function matchParte_(row, parteCfg) {
+    if (!parteCfg) return false;
+    var rowCanal = String(row[col.channel] || '').trim().toLowerCase();
+    var cfgCanal = String(parteCfg.canal || '').trim().toLowerCase();
+    var canalOk = !cfgCanal || rowCanal === cfgCanal;
+    var rowUrl = normUrlStrict_(row[col.url] || '');
+    return canalOk && (!parteCfg.urls.length || parteCfg.urls.some(function(u){ return rowUrl === u; }));
+  }
+
+  function blankAgg_() {
+    return { impressions: 0, clicks: 0, revenue: 0, requests: 0, coverage_w_sum: 0, view_w_sum: 0, weight_w_sum: 0, coverage_sum: 0, view_sum: 0, row_count: 0 };
+  }
+
+  function pushRow_(agg, row) {
+    var impr = toNumber_(row[col.impr]);
+    var req = toNumber_(row[col.req]);
+    agg.impressions += impr;
+    agg.clicks += toNumber_(row[col.clicks]);
+    agg.revenue += toNumber_(row[col.revenue]);
+    agg.requests += req;
+    
+    agg.coverage_sum += toNumber_(row[col.cov]);
+    agg.view_sum += toNumber_(row[col.view]);
+    agg.row_count += 1;
+    
+    if (req > 0) {
+      agg.coverage_w_sum += toNumber_(row[col.cov]) * req;
+      agg.view_w_sum += toNumber_(row[col.view]) * req;
+      agg.weight_w_sum += req;
+    }
+  }
+
+  function finalizeAgg_(agg, useSimpleAverage) {
+    var impr=agg.impressions, clk=agg.clicks, rev=agg.revenue;
+    var ecpm = impr > 0 ? (rev * 1000 / impr) : 0;
+    var coverage, viewability;
+
+    if (useSimpleAverage) {
+      coverage = agg.row_count > 0 ? (agg.coverage_sum / agg.row_count) * 100 : 0;
+      viewability = agg.row_count > 0 ? (agg.view_sum / agg.row_count) * 100 : 0;
+    } else {
+      coverage = agg.weight_w_sum > 0 ? (agg.coverage_w_sum / agg.weight_w_sum) * 100 : 0;
+      viewability = agg.weight_w_sum > 0 ? (agg.view_w_sum / agg.weight_w_sum) * 100 : 0;
+    }
+    
+    return {
+      impressions: impr, clicks: clk, revenue: rev, requests: agg.requests,
+      ctr: impr > 0 ? (clk / impr) * 100 : 0, 
+      ecpm: ecpm, 
+      cpc: clk > 0 ? rev / clk : 0,
+      coverage: coverage, 
+      viewability: viewability, 
+      effectiveEcpm: ecpm * (coverage / 100)
+    };
+  }
+  
+  function classifyBlock_(adunit, parteName) {
+    var s = String(adunit || '').toLowerCase();
+    if (parteName === 'P1') {
+      if (s.includes('mob_top') || s.includes('mobile_top')) return {label:'mob_top (P1)', parte:'P1'};
+      if (s.includes('mob_interstitial') || s.includes('mobile_interstitial')) return {label:'mob_interstitial (P1)', parte:'P1'};
+      if (s.includes('mob_offerwall') || s.includes('mob_rewarded') || s.includes('mobile_offerwall') || s.includes('mobile_rewarded')) return {label:'mob_offerwall (P1)', parte:'P1'};
+    } else if (parteName === 'P2') {
+      if (s.includes('mob_offerwall') || s.includes('mob_rewarded') || s.includes('mobile_offerwall') || s.includes('mobile_rewarded')) return {label:'mob_offerwall (P2)', parte:'P2'};
+      if (s.includes('mob_top') || s.includes('mobile_top')) return {label:'mob_top (P2)', parte:'P2'};
+    } else if (parteName === 'Quiz') {
+      if (s.includes('rewarded')) return {label:'rewarded (Quiz)', parte:'Quiz'};
+    }
+    return null;
+  }
+  
+  var aggByPageParte={}, detailHour={}, detailDay={}, blocksAgg={}, p1InterstitialReqByPage={}, pageHourAgg={}, blockHourAgg={};
+  rows.forEach(function(row) {
+    if (!rowDateOk_(row)) return;
+    var dBase = parseDate_(row[col.date]); if (!dBase) return;
+    var hBase = parseInt(row[col.hour],10) || 0;
+    var dtMs = new Date(dBase.getFullYear(), dBase.getMonth(), dBase.getDate(), hBase, 0, 0, 0).getTime();
+
+    for (var pg in pageIndex) {
+      PART_ORDER.forEach(function(parteName) {
+        var cfgParte = pageIndex[pg][parteName];
+        if (!cfgParte || !matchParte_(row, cfgParte)) return;
+
+        var aggKey = pg + '||' + parteName;
+        if (!aggByPageParte[aggKey]) aggByPageParte[aggKey] = blankAgg_();
+        pushRow_(aggByPageParte[aggKey], row);
+
+        var adunit = String(row[col.adunit] || '').trim() || '(sem adunit)';
+        var detailKey = gran==='day' ? `${pg}||${parteName}||${adunit}` : `${pg}||${parteName}||${hBase}||${adunit}`;
+        var detailAgg = gran === 'day' ? detailDay : detailHour;
+        if (!detailAgg[detailKey]) detailAgg[detailKey] = blankAgg_();
+        pushRow_(detailAgg[detailKey], row);
+        
+        var cat = classifyBlock_(adunit, parteName);
+        if (cat) {
+          var bk = `${pg}||${cat.label}`;
+          if (!blocksAgg[bk]) blocksAgg[bk] = { agg: blankAgg_(), parte: cat.parte, label: cat.label };
+          pushRow_(blocksAgg[bk].agg, row);
+          
+          var bhk = `${pg}||${cat.label}||${dtMs}`;
+          if (!blockHourAgg[bhk]) blockHourAgg[bhk] = blankAgg_();
+          pushRow_(blockHourAgg[bhk], row);
+        }
+
+        var keyMs = `${pg}||${dtMs}`;
+        if (parteName==='P1' && adunit.toLowerCase().includes('interstitial')) {
+          if (!p1InterstitialReqByPage[pg]) p1InterstitialReqByPage[pg] = 0;
+          p1InterstitialReqByPage[pg] += toNumber_(row[col.req]);
+          if (!pageHourAgg[keyMs]) pageHourAgg[keyMs] = { aggP1P2: blankAgg_(), reqP1Interstitial:0 };
+          pageHourAgg[keyMs].reqP1Interstitial += toNumber_(row[col.req]);
+        }
+        if (parteName==='P1' || parteName==='P2') {
+          if (!pageHourAgg[keyMs]) pageHourAgg[keyMs] = { aggP1P2: blankAgg_(), reqP1Interstitial:0 };
+          pushRow_(pageHourAgg[keyMs].aggP1P2, row);
+        }
+      });
+    }
+  });
+
+  var pages = [], compare = [], compareBlocks = [];
+  paginasSelecionadas.forEach(function(pgName) {
+    var parts = [], totAgg = blankAgg_();
+    PART_ORDER.forEach(function(pn2) {
+      if (pageIndex[pgName] && pageIndex[pgName][pn2]) {
+        var partAggregator = aggByPageParte[`${pgName}||${pn2}`] || blankAgg_();
+        var details = [];
+        var detailSource = gran === 'day' ? detailDay : detailHour;
+        Object.keys(detailSource).filter(k => k.startsWith(`${pgName}||${pn2}||`)).forEach(k => {
+          var p = k.split('||');
+          details.push({
+            hour: gran === 'day' ? null : parseInt(p[2], 10),
+            adunit: gran === 'day' ? p[2] : p.slice(3).join('||'),
+            metrics: finalizeAgg_(detailSource[k], gran !== 'day')
+          });
+        });
+
+        details.forEach(function(d) {
+          if (String(d.adunit).toLowerCase().match(/offerwall|rewarded/)) {
+            const m = d.metrics;
+            const perdaUsuario = (m.requests * (m.coverage / 100)) - m.impressions;
+            d.metrics.cpcCorrigido = ((m.clicks + Math.ceil(Math.max(0, perdaUsuario))) > 0) ?
+            (m.revenue / (m.clicks + Math.ceil(Math.max(0, perdaUsuario)))) : 0;
+          }
+        });
+        
+        parts.push({ 
+          parte: pn2, 
+          metrics: finalizeAgg_(partAggregator, false), 
+          details: details, 
+          meta: pageIndex[pgName][pn2] 
+        });
+
+        Object.keys(partAggregator).forEach(key => totAgg[key] += partAggregator[key]);
+      }
+    });
+    var totalFinal = finalizeAgg_(totAgg, false);
+    var reqInt = p1InterstitialReqByPage[pgName] || 0;
+    var revenueP1P2 = (aggByPageParte[`${pgName}||P1`]?.revenue||0) + (aggByPageParte[`${pgName}||P2`]?.revenue||0);
+    var clicksP1P2 = (aggByPageParte[`${pgName}||P1`]?.clicks||0) + (aggByPageParte[`${pgName}||P2`]?.clicks||0);
+    var rps = reqInt > 0 ? (revenueP1P2 / reqInt) * 1000 : 0;
+    var interactionRate = reqInt > 0 ? (clicksP1P2 / reqInt) * 100 : 0;
+    var cpcP1P2 = clicksP1P2 > 0 ? (revenueP1P2 / clicksP1P2) : 0;
+    var interactionRateCapped = Math.max(0, Math.min(interactionRate, 100));
+    var cpcCorrigido = cpcP1P2 * (interactionRateCapped / 100);
+    pages.push({ page: pgName, parts: parts, total: totalFinal, extras: { rps, interactionRate, cpcP1P2, cpcCorrigido } });
+    compare.push({
+      page: pgName,
+      ...totalFinal,
+      rps,
+      interactionRate,
+      cpcP1P2,
+      cpcCorrigido,
+      reqP1Interstitial: reqInt,
+      revenueP1P2: revenueP1P2,
+      clicksP1P2: clicksP1P2
+    });
+    Object.keys(blocksAgg).filter(k=>k.startsWith(`${pgName}||`)).forEach(k => {
+      compareBlocks.push({ page: pgName, label: blocksAgg[k].label, parte: blocksAgg[k].parte, metrics: finalizeAgg_(blocksAgg[k].agg, false) });
+    });
+  });
+  
+  var labelsChart = [], allHourMs = [...new Set(Object.keys(pageHourAgg).map(k => +k.split('||')[1]))];
+  if (allHourMs.length > 0) {
+    for (var t = Math.min(...allHourMs); t <= Math.max(...allHourMs); t += 3600000) labelsChart.push(t);
+  }
+
+  function generateSeries_(aggSource, keyGenFn) {
+    if (labelsChart.length === 0) return [];
+    return paginasSelecionadas.map(pgName => ({
+      page: pgName,
+      points: labelsChart.map(ms => {
+        var bucket = aggSource[keyGenFn(pgName, ms)] || {};
+        var metrics = finalizeAgg_(bucket.aggP1P2 || bucket || blankAgg_(), true);
+        var d = new Date(ms);
+        return {
+          label: `${('0'+d.getDate()).slice(-2)}/${('0'+(d.getMonth()+1)).slice(-2)} ${('0'+d.getHours()).slice(-2)}:00`,
+          rps: bucket.reqP1Interstitial > 0 ? (metrics.revenue / bucket.reqP1Interstitial * 1000) : 0,
+          interactionRate: bucket.reqP1Interstitial > 0 ? (metrics.clicks / bucket.reqP1Interstitial * 100) : 0,
+          ...metrics
+        };
+      })
+    }));
+  }
+
+  var seriesChart = generateSeries_(pageHourAgg, (pg, ms) => `${pg}||${ms}`);
+  var seriesChartByBlock = {};
+  ['mob_top (P1)', 'mob_interstitial (P1)', 'mob_offerwall (P1)', 'mob_offerwall (P2)', 'mob_top (P2)', 'rewarded (Quiz)'].forEach(blockLabel => {
+    seriesChartByBlock[blockLabel] = generateSeries_(blockHourAgg, (pg, ms) => `${pg}||${blockLabel}||${ms}`);
+  });
+  compare.sort((a,b) => b.revenue - a.revenue);
+  compareBlocks.sort((a,b) => (a.parte > b.parte) ? 1 : (a.parte < b.parte) ? -1 : (a.page > b.page) ? 1 : (a.page < b.page) ? -1 : b.metrics.revenue - a.metrics.revenue);
+  var pricingRulesAdSeleto = getPricingRulesAdSeleto_();
+  var pricingRulesIgoal = getPricingRulesIgoal_();
+
+  return { pages, compare, compareBlocks, granularity: gran, seriesChart, labelsChart, seriesChartByBlock, pricingRulesAdSeleto: pricingRulesAdSeleto, pricingRulesIgoal: pricingRulesIgoal };
+}
+
+function getCoordinationData(params) {
+  params = params || {};
+  var pessoa = params.pessoa;
+  var agrupamento = (params.agrupamento === 'last6h' || params.agrupamento === 'last3h') ? params.agrupamento : 'day';
+  var startDate = params.startDate;
+  var endDate = params.endDate;
+
+if (!startDate && !endDate) {
+    var today = todayIso_();
+    startDate = today;
+    endDate = today;
+  } else if (startDate && !endDate) {
+    endDate = startDate;
+  } else if (!startDate && endDate) {
+    startDate = endDate;
+  }
+
+  if (!pessoa) {
+    return { operations: [] };
+  }
+
+  var cfgRows = getConfig().rows.filter(function(r){ return r.pessoa === pessoa; });
+  if (!cfgRows.length) {
+    return { operations: [] };
+  }
+
+  var operationsMap = {};
+  cfgRows.forEach(function(row){
+    if (!operationsMap[row.operacao]) operationsMap[row.operacao] = { operacao: row.operacao, pages: {} };
+    if (!operationsMap[row.operacao].pages[row.pagina]) operationsMap[row.operacao].pages[row.pagina] = {};
+    operationsMap[row.operacao].pages[row.pagina][row.parte] = {
+      canal: row.canal,
+      urls: row.urls || [],
+      rede: row.rede,
+      moeda: row.moeda
+    };
+  });
+
+  var entries = cfgRows.map(function(row){
+    return {
+      operacao: row.operacao,
+      pagina: row.pagina,
+      parte: row.parte,
+      canal: row.canal,
+      urls: row.urls || []
+    };
+  });
+
+  if (!entries.length) {
+    return { operations: [] };
+  }
+
+  var baseSh = getBaseSheet_();
+  var data = baseSh.getDataRange().getValues();
+  if (!data.length) {
+    return { operations: Object.keys(operationsMap).map(function(name){ return { operacao: name, blocks: [] }; }) };
+  }
+
+  var headers = data[0] || [];
+  var idx = getHeaderIndexMap_(headers);
+  var rows = data.slice(1);
+
+  var col = {
+    date: idx[HEADER_MAP.date],
+    hour: idx[HEADER_MAP.hour],
+    channel: idx[HEADER_MAP.channel],
+    url: idx[HEADER_MAP.url],
+    adunit: idx[HEADER_MAP.adunit],
+    impressions: idx[HEADER_MAP.impressions],
+    clicks: idx[HEADER_MAP.clicks],
+    revenue: idx[HEADER_MAP.revenue],
+    requests: idx[HEADER_MAP.requests],
+    coverage: idx[HEADER_MAP.coverage],
+    viewability: idx[HEADER_MAP.viewability]
+  };
+
+  var minDate = startDate ? parseDate_(startDate) : null;
+  var maxDate = endDate ? parseDate_(endDate) : null;
+
+  var cutoffMs = null;
+  var rollingHours = agrupamento === 'last3h' ? 3 : (agrupamento === 'last6h' ? 6 : null);
+  if (rollingHours !== null) {
+    var maxMsMatched = 0;
+    rows.forEach(function(row){
+      var d = parseDate_(row[col.date]);
+      if (!d) return;
+      var h = parseInt(row[col.hour], 10) || 0;
+      var ms = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0).getTime();
+      if (ms > maxMsMatched) maxMsMatched = ms;
+    });
+    if (maxMsMatched > 0) cutoffMs = maxMsMatched - (rollingHours * 60 * 60 * 1000);
+  }
+
+  function rowDateOk_(row) {
+    var d = parseDate_(row[col.date]);
+    if (!d) return false;
+    if (rollingHours !== null) {
+      if (cutoffMs === null) return false;
+      var h = parseInt(row[col.hour], 10) || 0;
+      var ms = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0).getTime();
+      return ms >= cutoffMs;
+    }
+    if (minDate && d < minDate) return false;
+    if (maxDate && d > maxDate) return false;
+    return true;
+  }
+
+  function matchEntry_(row, entry) {
+    var rowCanal = String(row[col.channel] || '').trim().toLowerCase();
+    var cfgCanal = String(entry.canal || '').trim().toLowerCase();
+    if (cfgCanal && rowCanal !== cfgCanal) {
+      return false;
+    }
+    var normUrl = normUrlStrict_(row[col.url] || '');
+    var urls = entry.urls || [];
+    if (!urls.length) return true;
+    return urls.some(function(u){
+      return normUrl === u;
+    });
+  }
+
+  function blankAgg_() {
+    return {
+      impressions: 0,
+      clicks: 0,
+      revenue: 0,
+      requests: 0,
+      coverage_w_sum: 0,
+      view_w_sum: 0,
+      weight_w_sum: 0,
+      coverage_sum: 0,
+      view_sum: 0,
+      row_count: 0
+    };
+  }
+
+  function pushRow_(agg, row) {
+    var impr = toNumber_(row[col.impressions]);
+    var clk = toNumber_(row[col.clicks]);
+    var rev = toNumber_(row[col.revenue]);
+    var req = toNumber_(row[col.requests]);
+    var cov = toNumber_(row[col.coverage]);
+    var view = toNumber_(row[col.viewability]);
+
+    agg.impressions += impr;
+    agg.clicks += clk;
+    agg.revenue += rev;
+    agg.requests += req;
+    agg.coverage_sum += cov;
+    agg.view_sum += view;
+    agg.row_count += 1;
+
+    if (req > 0) {
+      agg.coverage_w_sum += cov * req;
+      agg.view_w_sum += view * req;
+      agg.weight_w_sum += req;
+    }
+  }
+
+  function finalizeAgg_(agg) {
+    var impr = agg.impressions;
+    var clk = agg.clicks;
+    var rev = agg.revenue;
+    var req = agg.requests;
+
+    var coverage = agg.weight_w_sum > 0 ? (agg.coverage_w_sum / agg.weight_w_sum) * 100 : (agg.row_count > 0 ? (agg.coverage_sum / agg.row_count) * 100 : 0);
+    var viewability = agg.weight_w_sum > 0 ? (agg.view_w_sum / agg.weight_w_sum) * 100 : (agg.row_count > 0 ? (agg.view_sum / agg.row_count) * 100 : 0);
+
+    return {
+      impressions: impr,
+      clicks: clk,
+      revenue: rev,
+      requests: req,
+      ctr: impr > 0 ? (clk / impr) * 100 : 0,
+      ecpm: impr > 0 ? (rev * 1000 / impr) : 0,
+      cpc: clk > 0 ? rev / clk : 0,
+      coverage: coverage,
+      viewability: viewability
+    };
+  }
+
+  function classifyBlock_(adunit, parteName) {
+    var s = String(adunit || '').toLowerCase();
+    if (parteName === 'P1') {
+      if (s.indexOf('mob_top') !== -1 || s.indexOf('mobile_top') !== -1) return { label: 'mob_top (P1)', parte: 'P1' };
+      if (s.indexOf('mob_interstitial') !== -1 || s.indexOf('mobile_interstitial') !== -1) return { label: 'mob_interstitial (P1)', parte: 'P1' };
+      if (s.indexOf('mob_offerwall') !== -1 || s.indexOf('mob_rewarded') !== -1 || s.indexOf('mobile_offerwall') !== -1 || s.indexOf('mobile_rewarded') !== -1) return { label: 'mob_offerwall (P1)', parte: 'P1' };
+    } else if (parteName === 'P2') {
+      if (s.indexOf('mob_offerwall') !== -1 || s.indexOf('mob_rewarded') !== -1 || s.indexOf('mobile_offerwall') !== -1 || s.indexOf('mobile_rewarded') !== -1) return { label: 'mob_offerwall (P2)', parte: 'P2' };
+      if (s.indexOf('mob_top') !== -1 || s.indexOf('mobile_top') !== -1) return { label: 'mob_top (P2)', parte: 'P2' };
+    } else if (parteName === 'Quiz') {
+      if (s.indexOf('rewarded') !== -1) return { label: 'rewarded (Quiz)', parte: 'Quiz' };
+    }
+    return null;
+  }
+
+  function mergeAgg_(target, source) {
+    if (!source) return;
+    target.impressions += source.impressions || 0;
+    target.clicks += source.clicks || 0;
+    target.revenue += source.revenue || 0;
+    target.requests += source.requests || 0;
+    target.coverage_w_sum += source.coverage_w_sum || 0;
+    target.view_w_sum += source.view_w_sum || 0;
+    target.weight_w_sum += source.weight_w_sum || 0;
+    target.coverage_sum += source.coverage_sum || 0;
+    target.view_sum += source.view_sum || 0;
+    target.row_count += source.row_count || 0;
+  }
+
+  function formatHourLabel_(ms) {
+    var d = new Date(ms);
+    var day = ('0' + d.getDate()).slice(-2);
+    var month = ('0' + (d.getMonth() + 1)).slice(-2);
+    var hour = ('0' + d.getHours()).slice(-2);
+    return day + '/' + month + ' ' + hour + 'h';
+  }
+
+  function buildSuggestionBasis_(baseKey, bucketMap) {
+    var prefix = baseKey + '||';
+    var hourKeys = Object.keys(bucketMap).filter(function(k){ return k.indexOf(prefix) === 0; }).map(function(k){
+      var parts = k.split('||');
+      return parts.length >= 4 ? +parts[3] : null;
+    }).filter(function(v){ return v; }).sort(function(a,b){ return a - b; });
+
+    if (hourKeys.length < 2) {
+      return { hasData: false };
+    }
+
+    var sliceStart = Math.max(0, hourKeys.length - 4);
+    var relevant = hourKeys.slice(sliceStart, hourKeys.length - 1);
+    if (!relevant.length) {
+      return { hasData: false };
+    }
+
+    var agg = blankAgg_();
+    var weightedEcpmSum = 0;
+    var requestWeightSum = 0;
+    relevant.forEach(function(ms){
+      var key = prefix + ms;
+      var bucket = bucketMap[key];
+      if (!bucket) return;
+      mergeAgg_(agg, bucket);
+      var hourRequests = bucket.requests || 0;
+      if (hourRequests > 0) {
+        var hourImpressions = bucket.impressions || 0;
+        var hourRevenue = bucket.revenue || 0;
+        if (hourImpressions > 0) {
+          var hourEcpm = (hourRevenue * 1000) / hourImpressions;
+          weightedEcpmSum += hourEcpm * hourRequests;
+          requestWeightSum += hourRequests;
+        }
+      }
+    });
+
+    var metrics = finalizeAgg_(agg);
+    var coverage = metrics.coverage || 0;
+    var perdaUsuario = (agg.requests * (coverage / 100)) - agg.impressions;
+    var correctedClicks = agg.clicks + Math.ceil(Math.max(0, perdaUsuario));
+    var cpcCorrigido = correctedClicks > 0 ? (agg.revenue / correctedClicks) : 0;
+    var weightedEcpm = requestWeightSum > 0 ? (weightedEcpmSum / requestWeightSum) : metrics.ecpm;
+
+    return {
+      hasData: true,
+      coverage: coverage,
+      cpc: metrics.cpc || 0,
+      ecpm: weightedEcpm || 0,
+      cpcCorrigido: cpcCorrigido,
+      hoursUsed: relevant.map(formatHourLabel_)
+    };
+  }
+
+  var blockAgg = {};
+  var blockHourAgg = {};
+
+  rows.forEach(function(row){
+    if (!rowDateOk_(row)) return;
+    var d = parseDate_(row[col.date]);
+    if (!d) return;
+    var h = parseInt(row[col.hour], 10) || 0;
+    var ms = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0).getTime();
+
+    entries.forEach(function(entry){
+      if (!matchEntry_(row, entry)) return;
+      var adunit = String(row[col.adunit] || '').trim() || '(sem adunit)';
+      var classification = classifyBlock_(adunit, entry.parte);
+      if (!classification) return;
+      var baseKey = entry.operacao + '||' + entry.pagina + '||' + classification.label;
+      if (!blockAgg[baseKey]) blockAgg[baseKey] = blankAgg_();
+      pushRow_(blockAgg[baseKey], row);
+      var hourKey = baseKey + '||' + ms;
+      if (!blockHourAgg[hourKey]) blockHourAgg[hourKey] = blankAgg_();
+      pushRow_(blockHourAgg[hourKey], row);
+    });
+  });
+
+  var operations = Object.keys(operationsMap).map(function(opName){
+    var blocks = [];
+    Object.keys(blockAgg).forEach(function(key){
+      if (key.indexOf(opName + '||') !== 0) return;
+      var parts = key.split('||');
+      var pageName = parts[1];
+      var label = parts[2];
+      var agg = blockAgg[key];
+      var metrics = finalizeAgg_(agg);
+      var suggestionBasis = buildSuggestionBasis_(key, blockHourAgg);
+      var parte = '';
+      if (label.indexOf('(P1)') !== -1) parte = 'P1';
+      else if (label.indexOf('(P2)') !== -1) parte = 'P2';
+      else if (label.indexOf('(Quiz)') !== -1) parte = 'Quiz';
+      blocks.push({ page: pageName, label: label, parte: parte, metrics: metrics, suggestionBasis: suggestionBasis });
+    });
+    blocks.sort(function(a,b){
+      if (a.page !== b.page) return String(a.page || '').localeCompare(String(b.page || ''));
+      return String(a.label || '').localeCompare(String(b.label || ''));
+    });
+    return { operacao: opName, blocks: blocks };
+  });
+
+  return { operations: operations };
+}
+
+/* ============= ROTAS / DISTRIBUIÇÃO INTELIGENTE ============= */
+const ROUTE_CONFIG_SHEET = 'Rotas - API';
+const DISTRIBUTION_HISTORY_SHEET = 'Historico - Distribuicao';
+const DISTRIBUTION_WARNINGS_SHEET = 'Avisos - Distribuicao';
+const AUTOMATION_HANDLER = 'runHourlyAutomationSync';
+const DISTRIBUTION_DEFAULT_LIMITS = { minPercent: 0, maxPercent: 100 };
+const LINK_ROUTER_BASE_URL = 'https://rotasv2.spun.com.br';
+const LINK_ROUTER_TOKEN = '1|crewZvM3pCrHsz9gwWVfzyzQ5IrTk0T7gltREA4d67dc7105';
+
+function ensureRouteConfigSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(ROUTE_CONFIG_SHEET);
+  var headers = ['ID','Operação','Suboperação','Empresa ID','Domínio ID','Slug da Rota','Automação Ativa','Min %','Max %','Última Sincronização'];
+  if (!sh) {
+    sh = ss.insertSheet(ROUTE_CONFIG_SHEET);
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+    return sh;
+  }
+
+  var maxCol = Math.max(headers.length, sh.getLastColumn());
+  var current = sh.getRange(1,1,1,maxCol).getValues()[0];
+
+  // Migração legado: versão antiga possuía coluna "URL P1".
+  // Remove essa coluna para manter alinhamento correto dos dados.
+  var urlP1LegacyIndex = current.indexOf('URL P1');
+  if (urlP1LegacyIndex >= 0) {
+    sh.deleteColumn(urlP1LegacyIndex + 1);
+    maxCol = Math.max(headers.length, sh.getLastColumn());
+    current = sh.getRange(1,1,1,maxCol).getValues()[0];
+  }
+
+  var needs = false;
+  headers.forEach(function(h, i){ if (current[i] !== h) needs = true; });
+  if (needs) sh.getRange(1,1,1,headers.length).setValues([headers]);
+  return sh;
+}
+
+function ensureDistributionHistorySheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(DISTRIBUTION_HISTORY_SHEET);
+  var headers = ['Data/Hora','Operação','Suboperação','URL P1','Empresa ID','Domínio ID','Slug da rota','CPC Corrigido','Solicitações','Receita','Percentual sugerido','Percentual enviado','Status','Mensagem'];
+  if (!sh) {
+    sh = ss.insertSheet(DISTRIBUTION_HISTORY_SHEET);
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function ensureDistributionWarningsSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(DISTRIBUTION_WARNINGS_SHEET);
+  var headers = ['Data/Hora','Operação','Suboperação','URL P1','Tipo','Mensagem'];
+  if (!sh) {
+    sh = ss.insertSheet(DISTRIBUTION_WARNINGS_SHEET);
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function listRouteApiConfigs() {
+  var sh = ensureRouteConfigSheet_();
+  var values = sh.getDataRange().getValues();
+  if (values.length <= 1) return [];
+  var idx = getHeaderIndexMap_(values[0]);
+  return values.slice(1).filter(function(r){ return String(r[idx['Operação']] || '').trim(); }).map(function(r){
+    return {
+      id: String(r[idx['ID']] || ''),
+      operacao: String(r[idx['Operação']] || '').trim(),
+      suboperacao: String(r[idx['Suboperação']] || '').trim(),
+      empresaId: String(r[idx['Empresa ID']] || '').trim(),
+      dominioId: String(r[idx['Domínio ID']] || '').trim(),
+      slugRota: String(r[idx['Slug da Rota']] || '').trim(),
+      automacaoAtiva: String(r[idx['Automação Ativa']] || '').toLowerCase() === 'sim',
+      minPercent: toNumber_(r[idx['Min %']]),
+      maxPercent: toNumber_(r[idx['Max %']]),
+      ultimaSincronizacao: r[idx['Última Sincronização']] || ''
+    };
+  });
+}
+
+function saveRouteApiConfig(payload) {
+  payload = payload || {};
+  var operacao = String(payload.operacao || '').trim();
+  var suboperacao = String(payload.suboperacao || '').trim();
+  if (!operacao || !suboperacao) throw new Error('Operação e Suboperação são obrigatórios.');
+  var sh = ensureRouteConfigSheet_();
+  var values = sh.getDataRange().getValues();
+  var idx = getHeaderIndexMap_(values[0] || []);
+  var duplicate = values.slice(1).some(function(r){
+    if (payload.id && String(r[idx['ID']] || '') === String(payload.id)) return false;
+    return String(r[idx['Operação']] || '').trim().toLowerCase() === operacao.toLowerCase() &&
+           String(r[idx['Suboperação']] || '').trim().toLowerCase() === suboperacao.toLowerCase();
+  });
+  if (duplicate) throw new Error('Já existe uma integração para esta operação e suboperação.');
+  var rowValues = [
+    payload.id || Utilities.getUuid(),
+    operacao,
+    suboperacao,
+    String(payload.empresaId || '').trim(),
+    String(payload.dominioId || '').trim(),
+    String(payload.slugRota || '').trim(),
+    payload.automacaoAtiva ? 'Sim' : 'Não',
+    payload.minPercent != null ? Number(payload.minPercent) : DISTRIBUTION_DEFAULT_LIMITS.minPercent,
+    payload.maxPercent != null ? Number(payload.maxPercent) : DISTRIBUTION_DEFAULT_LIMITS.maxPercent,
+    payload.ultimaSincronizacao || ''
+  ];
+
+  if (payload.id) {
+    for (var i = 1; i < values.length; i++) {
+      if (String(values[i][idx['ID']] || '') === String(payload.id)) {
+        sh.getRange(i + 1, 1, 1, rowValues.length).setValues([rowValues]);
+        return { ok: true, id: payload.id };
+      }
+    }
+  }
+  sh.appendRow(rowValues);
+  return { ok: true, id: rowValues[0] };
+}
+
+function deleteRouteApiConfig(id) {
+  var sh = ensureRouteConfigSheet_();
+  var values = sh.getDataRange().getValues();
+  var idx = getHeaderIndexMap_(values[0] || []);
+  for (var i = 1; i < values.length; i++) {
+    if (String(values[i][idx['ID']] || '') === String(id || '')) {
+      sh.deleteRow(i + 1);
+      return { ok: true };
+    }
+  }
+  return { ok: false };
+}
+
+function listOperationsSuboperations() {
+  var cfg = getConfig();
+  var map = {};
+  (cfg.rows || []).forEach(function(row){
+    var op = String(row.operacao || '').trim();
+    var sub = String(row.suboperacao || '').trim();
+    if (!op || !sub) return;
+    if (!map[op]) map[op] = {};
+    map[op][sub] = true;
+  });
+  var operations = Object.keys(map).sort().map(function(op){
+    return { operacao: op, suboperacoes: Object.keys(map[op]).sort() };
+  });
+  return { operations: operations };
+}
+
+function calculateCpcDistribution(params) {
+  params = params || {};
+
+  function normText_(value) {
+    return String(value || '').trim().toLowerCase();
+  }
+  function keyFor_(operacao, suboperacao) {
+    return normText_(operacao) + '||' + normText_(suboperacao);
+  }
+
+  var requestedOp = String(params.operacao || '').trim();
+  var requestedSub = String(params.suboperacao || '').trim();
+  var requestedOpNorm = normText_(requestedOp);
+  var requestedSubNorm = normText_(requestedSub);
+
+  var allRouteConfigs = listRouteApiConfigs();
+  var routeConfigs = allRouteConfigs.filter(function(rc){
+    var opNorm = normText_(rc.operacao);
+    var subNorm = normText_(rc.suboperacao);
+    if (requestedOpNorm && opNorm !== requestedOpNorm) return false;
+    if (requestedSubNorm && subNorm !== requestedSubNorm) return false;
+    return true;
+  });
+
+  var cfg = getConfig();
+  var cfgRowsFiltered = (cfg.rows || []).filter(function(r){
+    var opNorm = normText_(r.operacao);
+    var subNorm = normText_(r.suboperacao);
+    if (requestedOpNorm && opNorm !== requestedOpNorm) return false;
+    if (requestedSubNorm && subNorm !== requestedSubNorm) return false;
+    return true;
+  });
+  var allP1Entries = (cfg.rows || []).filter(function(r){ return String(r.parte || '').toUpperCase() === 'P1'; });
+  var p1Entries = cfgRowsFiltered.filter(function(r){ return String(r.parte || '').toUpperCase() === 'P1'; });
+
+  var routeByKey = {};
+  var groupLabelByKey = {};
+  routeConfigs.forEach(function(rc){
+    var key = keyFor_(rc.operacao, rc.suboperacao);
+    routeByKey[key] = rc;
+    if (!groupLabelByKey[key]) groupLabelByKey[key] = { operacao: rc.operacao || '', suboperacao: rc.suboperacao || '' };
+  });
+
+  var localUrlsByGroup = {};
+  var localUrlPageByGroup = {};
+  var duplicateUrlWarningsByGroup = {};
+  var pageByUrlByGroup = {};
+
+  cfgRowsFiltered.forEach(function(entry){
+    var key = keyFor_(entry.operacao, entry.suboperacao);
+    if (!pageByUrlByGroup[key]) pageByUrlByGroup[key] = {};
+    if (!groupLabelByKey[key]) groupLabelByKey[key] = { operacao: entry.operacao || '', suboperacao: entry.suboperacao || '' };
+    (entry.urls || []).forEach(function(u){
+      var normalized = normUrlStrict_(u);
+      if (!normalized) return;
+      if (!pageByUrlByGroup[key][normalized]) pageByUrlByGroup[key][normalized] = entry.pagina || '';
+    });
+  });
+
+  p1Entries.forEach(function(entry){
+    var key = keyFor_(entry.operacao, entry.suboperacao);
+    if (!localUrlsByGroup[key]) localUrlsByGroup[key] = {};
+    if (!localUrlPageByGroup[key]) localUrlPageByGroup[key] = {};
+    if (!duplicateUrlWarningsByGroup[key]) duplicateUrlWarningsByGroup[key] = {};
+    if (!groupLabelByKey[key]) groupLabelByKey[key] = { operacao: entry.operacao || '', suboperacao: entry.suboperacao || '' };
+    (entry.urls || []).forEach(function(u){
+      var normalized = normUrlStrict_(u);
+      if (!normalized) return;
+      localUrlsByGroup[key][normalized] = true;
+      if (!localUrlPageByGroup[key][normalized]) {
+        localUrlPageByGroup[key][normalized] = entry.pagina || '';
+      } else if (localUrlPageByGroup[key][normalized] !== (entry.pagina || '')) {
+        duplicateUrlWarningsByGroup[key][normalized] = true;
+      }
+    });
+  });
+
+  var routeUrlsByGroup = {};
+  var routeCurrentPctByGroup = {};
+  var routeFetchWarnings = {};
+
+  function pushFetchWarning_(groupKey, message) {
+    if (!routeFetchWarnings[groupKey]) routeFetchWarnings[groupKey] = [];
+    routeFetchWarnings[groupKey].push(message);
+  }
+
+  routeConfigs.forEach(function(rc){
+    var groupKey = keyFor_(rc.operacao, rc.suboperacao);
+    if (!routeUrlsByGroup[groupKey]) routeUrlsByGroup[groupKey] = {};
+    if (!routeCurrentPctByGroup[groupKey]) routeCurrentPctByGroup[groupKey] = {};
+
+    if (!rc.empresaId || !rc.dominioId || !rc.slugRota) {
+      pushFetchWarning_(groupKey, 'Configuração de rota incompleta para carregar URLs da API.');
+      return;
+    }
+
+    var routeResponse = fetchRouteSnapshot_(rc);
+    if (!routeResponse || !routeResponse.ok) {
+      pushFetchWarning_(groupKey, 'Falha ao carregar links da rota para prévia.');
+      return;
+    }
+
+    var routeLinks = (((routeResponse.body || {}).data || {}).links || []);
+    if (!routeLinks.length) {
+      pushFetchWarning_(groupKey, 'Rota sem links retornados pela API.');
+      return;
+    }
+
+    routeLinks.forEach(function(link){
+      var normalized = normUrlStrict_(link.url || link.link || link.destination_url || '');
+      if (!normalized) return;
+      routeUrlsByGroup[groupKey][normalized] = true;
+      routeCurrentPctByGroup[groupKey][normalized] = toNumber_(link.percentage || link.percentual || 0);
+    });
+  });
+
+  var groupsMap = {};
+
+  function ensureGroup_(groupKey){
+    if (!groupsMap[groupKey]) {
+      var label = groupLabelByKey[groupKey] || { operacao: '', suboperacao: '' };
+      groupsMap[groupKey] = { operacao: label.operacao || '', suboperacao: label.suboperacao || '', urls: {} };
+    }
+    return groupsMap[groupKey];
+  }
+
+  Object.keys(localUrlsByGroup).forEach(function(groupKey){
+    var group = ensureGroup_(groupKey);
+    Object.keys(localUrlsByGroup[groupKey]).forEach(function(url){ group.urls[url] = true; });
+  });
+
+  Object.keys(routeUrlsByGroup).forEach(function(groupKey){
+    var group = ensureGroup_(groupKey);
+    Object.keys(routeUrlsByGroup[groupKey]).forEach(function(url){ group.urls[url] = true; });
+  });
+
+  Object.keys(routeByKey).forEach(function(groupKey){ ensureGroup_(groupKey); });
+
+  var pageMetricsByGroup = {};
+  Object.keys(groupsMap).forEach(function(groupKey){
+    pageMetricsByGroup[groupKey] = {};
+    var pagesInGroup = {};
+    Object.keys(pageByUrlByGroup[groupKey] || {}).forEach(function(url){
+      var page = pageByUrlByGroup[groupKey][url];
+      if (page) pagesInGroup[page] = true;
+    });
+    Object.keys(pagesInGroup).forEach(function(page){
+      pageMetricsByGroup[groupKey][page] = { impressions: 0, clicks: 0, revenue: 0, requests: 0, coverageReqWeighted: 0 };
+    });
+  });
+
+  var baseSh = getBaseSheet_();
+  var data = baseSh.getDataRange().getValues();
+  var headers = data[0] || [];
+  var idx = getHeaderIndexMap_(headers);
+  var col = {
+    url: idx[HEADER_MAP.url],
+    impressions: idx[HEADER_MAP.impressions],
+    clicks: idx[HEADER_MAP.clicks],
+    revenue: idx[HEADER_MAP.revenue],
+    requests: idx[HEADER_MAP.requests],
+    coverage: idx[HEADER_MAP.coverage]
+  };
+
+  data.slice(1).forEach(function(row){
+    var normalizedUrl = normUrlStrict_(row[col.url] || '');
+    if (!normalizedUrl) return;
+    Object.keys(pageMetricsByGroup).forEach(function(groupKey){
+      var pageName = (pageByUrlByGroup[groupKey] || {})[normalizedUrl];
+      if (!pageName) return;
+      if (!pageMetricsByGroup[groupKey][pageName]) {
+        pageMetricsByGroup[groupKey][pageName] = { impressions: 0, clicks: 0, revenue: 0, requests: 0, coverageReqWeighted: 0 };
+      }
+      var bucket = pageMetricsByGroup[groupKey][pageName];
+      var requests = toNumber_(row[col.requests]);
+      var coverage = toNumber_(row[col.coverage]);
+      bucket.impressions += toNumber_(row[col.impressions]);
+      bucket.clicks += toNumber_(row[col.clicks]);
+      bucket.revenue += toNumber_(row[col.revenue]);
+      bucket.requests += requests;
+      bucket.coverageReqWeighted += coverage * requests;
+    });
+  });
+
+  var resultGroups = [];
+  Object.keys(groupsMap).forEach(function(groupKey){
+    var group = groupsMap[groupKey];
+    var routeCfg = routeByKey[groupKey] || null;
+    var routeUrlsSet = routeUrlsByGroup[groupKey] || {};
+    var localUrlsSet = localUrlsByGroup[groupKey] || {};
+    var localUrlPageMap = localUrlPageByGroup[groupKey] || {};
+    var routeCurrentPct = routeCurrentPctByGroup[groupKey] || {};
+
+    var candidates = Object.keys(group.urls).map(function(url){
+      var pageName = localUrlPageMap[url] || (pageByUrlByGroup[groupKey] || {})[url] || '';
+      var m = pageName ? ((pageMetricsByGroup[groupKey] || {})[pageName] || { impressions:0, clicks:0, revenue:0, requests:0, coverageReqWeighted:0 }) : { impressions:0, clicks:0, revenue:0, requests:0, coverageReqWeighted:0 };
+      var coverage = m.requests > 0 ? (m.coverageReqWeighted / m.requests) : 0;
+      var perdaUsuario = (m.requests * (coverage / 100)) - m.impressions;
+      var correctedClicks = m.clicks + Math.ceil(Math.max(0, perdaUsuario));
+      var cpcCorrigido = correctedClicks > 0 ? (m.revenue / correctedClicks) : 0;
+
+      var reasons = [];
+      if (!localUrlsSet[url]) reasons.push('URL existe na rota, mas não existe na suboperação local.');
+      if (!routeUrlsSet[url]) reasons.push('URL existe na suboperação local, mas não existe na rota.');
+      if (!pageName) reasons.push('URL sem Página de Queda (P1) correspondente na suboperação.');
+      if (duplicateUrlWarningsByGroup[groupKey] && duplicateUrlWarningsByGroup[groupKey][url]) reasons.push('URL duplicada em mais de uma Página de Queda P1 na suboperação.');
+      if (!routeCfg) reasons.push('Sem configuração de rota/API para Operação + Suboperação');
+      else if (!routeCfg.automacaoAtiva) reasons.push('Automação inativa para Operação + Suboperação');
+      if (m.requests > 50 && m.revenue <= 0) reasons.push('Mais de 50 solicitações e receita zero');
+      if (!isFinite(cpcCorrigido) || cpcCorrigido <= 0) reasons.push('CPC Corrigido inválido/zerado');
+
+      return {
+        operacao: group.operacao,
+        suboperacao: group.suboperacao,
+        urlP1: url,
+        pagina: pageName,
+        requests: m.requests,
+        revenue: m.revenue,
+        cpcCorrigido: cpcCorrigido,
+        routeConfig: routeCfg,
+        eligible: reasons.length === 0,
+        exclusionReasons: reasons,
+        percentualSugerido: 0,
+        percentualAtualRota: routeCurrentPct.hasOwnProperty(url) ? routeCurrentPct[url] : null,
+        diferencaPercentual: null
+      };
+    });
+
+    var eligible = candidates.filter(function(c){ return c.eligible; });
+    if (!eligible.length) {
+      candidates.forEach(function(c){ c.percentualSugerido = 0; });
+    } else if (eligible.length === 1) {
+      eligible[0].percentualSugerido = 100;
+    } else {
+      var totalCpc = eligible.reduce(function(acc, c){ return acc + Math.max(0, c.cpcCorrigido); }, 0);
+      if (totalCpc <= 0) {
+        eligible.forEach(function(c){ c.percentualSugerido = 0; c.exclusionReasons.push('Divisão por zero evitada (CPC total).'); c.eligible = false; });
+      } else {
+        eligible.forEach(function(c){
+          var raw = (Math.max(0, c.cpcCorrigido) / totalCpc) * 100;
+          var minP = c.routeConfig ? Math.max(0, toNumber_(c.routeConfig.minPercent)) : 0;
+          var maxP = c.routeConfig ? Math.min(100, toNumber_(c.routeConfig.maxPercent) || 100) : 100;
+          if (maxP < minP) maxP = minP;
+          c.percentualSugerido = Math.min(maxP, Math.max(minP, raw));
+        });
+        var sum = eligible.reduce(function(acc, c){ return acc + c.percentualSugerido; }, 0);
+        if (sum > 0) eligible.forEach(function(c){ c.percentualSugerido = (c.percentualSugerido / sum) * 100; });
+      }
+    }
+
+    candidates.forEach(function(c){
+      if (c.percentualAtualRota != null) c.diferencaPercentual = c.percentualSugerido - c.percentualAtualRota;
+    });
+
+    var groupWarnings = (routeFetchWarnings[groupKey] || []).slice();
+    candidates.forEach(function(c){ if (!c.eligible) groupWarnings.push(c.urlP1 + ': ' + c.exclusionReasons.join(', ')); });
+
+    resultGroups.push({
+      operacao: group.operacao,
+      suboperacao: group.suboperacao,
+      urls: candidates,
+      avisos: groupWarnings,
+      ultimaSincronizacao: routeCfg ? (routeCfg.ultimaSincronizacao || '') : ''
+    });
+  });
+
+  resultGroups.sort(function(a,b){
+    if (a.operacao !== b.operacao) return String(a.operacao || '').localeCompare(String(b.operacao || ''), 'pt-BR');
+    return String(a.suboperacao || '').localeCompare(String(b.suboperacao || ''), 'pt-BR');
+  });
+
+  var diagnostics = {
+    filtros: { operacao: requestedOp, suboperacao: requestedSub },
+    routeApi: getRouteApiHealth(),
+    routeConfigsTotais: allRouteConfigs.length,
+    routeConfigsEncontradas: routeConfigs.length,
+    p1LocaisTotais: allP1Entries.length,
+    p1LocaisEncontradas: p1Entries.length,
+    gruposGerados: resultGroups.length
+  };
+
+  return { groups: resultGroups, generatedAt: new Date(), diagnostics: diagnostics };
+}
+
+function getRouteApiSettings_() {
+  var baseUrl = String(LINK_ROUTER_BASE_URL || '').trim().replace(/\/+$/, '');
+  var token = getRouteApiToken_();
+  return { baseUrl: baseUrl, token: token, configured: !!(baseUrl && token) };
+}
+
+function getRouteApiToken_() {
+  var token = String(LINK_ROUTER_TOKEN || '').trim();
+  if (/^Bearer\s+/i.test(token)) token = token.replace(/^Bearer\s+/i, '');
+  return token;
+}
+
+function buildRouteApiHeaders_() {
+  return {
+    Authorization: 'Bearer ' + getRouteApiToken_(),
+    'Content-Type': 'application/json'
+  };
+}
+
+function callRouteApi_(path, method, qs, payload) {
+  var settings = getRouteApiSettings_();
+  if (!settings.configured) {
+    return { ok: false, code: 0, body: { status: 'error', message: 'Integração da API de rotas não configurada.' }, settings: settings };
+  }
+
+  var url = settings.baseUrl + path;
+  if (qs && Object.keys(qs).length) {
+    var query = Object.keys(qs).filter(function(key){
+      var value = qs[key];
+      return value !== null && value !== undefined && value !== '';
+    }).map(function(key){
+      return encodeURIComponent(key) + '=' + encodeURIComponent(String(qs[key]));
+    }).join('&');
+    if (query) url += (url.indexOf('?') >= 0 ? '&' : '?') + query;
+  }
+
+  var options = {
+    method: String(method || 'get').toUpperCase(),
+    muteHttpExceptions: true,
+    headers: buildRouteApiHeaders_()
+  };
+  var safeHeaders = { Authorization: settings.token ? 'Bearer ***' : '', 'Content-Type': 'application/json' };
+  if (payload) {
+    options.payload = JSON.stringify(payload);
+    options.contentType = 'application/json';
+  }
+
+  var resp;
+  Logger.log('[RouteAPI] Request => ' + JSON.stringify({ url: url, method: options.method, headers: safeHeaders, hasPayload: !!payload }));
+  try {
+    resp = UrlFetchApp.fetch(url, options);
+  } catch (err) {
+    return { ok: false, code: 0, body: { status: 'error', message: err && err.message ? err.message : String(err) }, settings: settings };
+  }
+
+  var code = resp.getResponseCode();
+  var text = resp.getContentText() || '';
+  Logger.log('[RouteAPI] Response => ' + JSON.stringify({ url: url, code: code, bodyPreview: text.slice(0, 800) }));
+  var body = {};
+  try { body = text ? JSON.parse(text) : {}; }
+  catch (err) { body = { status: 'error', message: text || 'Resposta inválida da API.' }; }
+
+  return { ok: code >= 200 && code < 300, code: code, body: body, raw: text, settings: settings };
+}
+
+
+
+function testRouteApiConnection(payload) {
+  payload = payload || {};
+  var companyId = String(payload.empresaId || '').trim();
+  var domainId = String(payload.dominioId || '').trim();
+  var slug = String(payload.slugRota || '').trim();
+  var settings = getRouteApiSettings_();
+  if (!companyId || !domainId || !slug) {
+    return {
+      ok: false,
+      message: 'Informe Empresa ID, Domínio ID e Slug para testar.',
+      request: { company_id: companyId, domain: domainId, slug: slug },
+      settings: { configured: settings.configured, baseUrl: settings.baseUrl, tokenConfigured: !!settings.token }
+    };
+  }
+  var response = callRouteApi_('/api/link_router/route', 'get', { company_id: companyId, domain: domainId, slug: slug }, null);
+  return {
+    ok: response.ok,
+    code: response.code,
+    request: { company_id: companyId, domain: domainId, slug: slug },
+    settings: { configured: settings.configured, baseUrl: settings.baseUrl, tokenConfigured: !!settings.token },
+    responseBody: response.body || {},
+    rawPreview: String(response.raw || '').slice(0, 2000)
+  };
+}
+
+function fetchRouteSnapshot_(config) {
+  var params = {
+    company_id: config.empresaId,
+    domain: config.dominioId,
+    slug: config.slugRota
+  };
+  return callRouteApi_('/api/link_router/route', 'get', params, null);
+}
+
+function pushRoutePercentages_(config, linkMap, pctMap) {
+  var payload = {
+    domain: Number(config.dominioId),
+    company_id: Number(config.empresaId),
+    slug: config.slugRota,
+    link: linkMap || {},
+    percentage: pctMap || {}
+  };
+  var resp = callRouteApi_('/api/link_router/links_and_percentage', 'put', null, payload);
+  return { code: resp.code, text: resp.raw || JSON.stringify(resp.body || {}), ok: resp.ok, body: resp.body || {} };
+}
+
+function getRouteApiHealth() {
+  var settings = getRouteApiSettings_();
+  return {
+    configured: settings.configured,
+    baseUrl: settings.baseUrl,
+    tokenConfigured: !!settings.token
+  };
+}
+
+function syncCpcDistributionNow(params) {
+  var distribution = calculateCpcDistribution(params || {});
+  var history = [];
+  var warnings = [];
+
+  distribution.groups.forEach(function(group){
+    var routeBuckets = {};
+    (group.urls || []).forEach(function(item){
+      var cfg = item.routeConfig;
+      if (!cfg || !cfg.automacaoAtiva) return;
+      var key = cfg.empresaId + '||' + cfg.dominioId + '||' + cfg.slugRota;
+      if (!routeBuckets[key]) routeBuckets[key] = { config: cfg, items: [] };
+      routeBuckets[key].items.push(item);
+    });
+
+    Object.keys(routeBuckets).forEach(function(key){
+      var bucket = routeBuckets[key];
+      var routeResponse = fetchRouteSnapshot_(bucket.config);
+      if (!routeResponse.ok) {
+        bucket.items.forEach(function(item){
+          history.push(buildHistoryRow_(item, bucket.config, item.percentualSugerido, '', 'erro', 'Falha ao consultar rota/API.'));
+        });
+        return;
+      }
+
+      var routeLinks = (((routeResponse.body || {}).data || {}).links || []);
+      var routeByNorm = {};
+      routeLinks.forEach(function(link){
+        var norm = normUrlStrict_(link.url || link.link || link.destination_url || '');
+        if (norm) routeByNorm[norm] = link;
+      });
+
+      var linkMap = {};
+      var pctMap = {};
+      var matchedAny = false;
+
+      routeLinks.forEach(function(link){
+        var id = String(link && (link.id != null ? link.id : link.link_id != null ? link.link_id : '')).trim();
+        if (!id) return;
+
+        var linkUrl = String(link.link || link.url || link.destination_url || '').trim();
+        var norm = normUrlStrict_(linkUrl);
+        linkMap[id] = linkUrl;
+
+        var localItem = null;
+        if (norm) {
+          localItem = bucket.items.find(function(item){ return item.urlP1 === norm; }) || null;
+        }
+
+        var percent = 0;
+        if (localItem) {
+          matchedAny = true;
+          localItem.percentualAtualRota = toNumber_(link.percentage || link.percentual || 0);
+          localItem.diferencaPercentual = localItem.percentualSugerido - localItem.percentualAtualRota;
+          percent = localItem.percentualSugerido;
+        } else {
+          percent = toNumber_(link.percentage || link.percentual || 0);
+          if (norm) warnings.push([new Date(), group.operacao, group.suboperacao, norm, 'URL_ROTA_FORA_SUBOPERACAO', 'URL existe na rota mas não na suboperação.']);
+        }
+
+        if (!isFinite(percent) || percent < 0) percent = 0;
+        pctMap[id] = Math.round(percent * 100) / 100;
+      });
+
+      bucket.items.forEach(function(item){
+        var routeItem = routeByNorm[item.urlP1];
+        if (!routeItem) {
+          warnings.push([new Date(), group.operacao, group.suboperacao, item.urlP1, 'URL_LOCAL_NAO_NA_ROTA', 'URL da suboperação não encontrada na rota.']);
+          history.push(buildHistoryRow_(item, bucket.config, item.percentualSugerido, '', 'aviso', 'URL da suboperação não encontrada na rota.'));
+        }
+      });
+
+      var ids = Object.keys(pctMap);
+      if (ids.length) {
+        var total = ids.reduce(function(acc, id){ return acc + (pctMap[id] || 0); }, 0);
+        if (total > 0 && Math.abs(total - 100) > 0.05) {
+          var scale = 100 / total;
+          total = 0;
+          ids.forEach(function(id){
+            var scaled = Math.round((pctMap[id] * scale) * 100) / 100;
+            pctMap[id] = Math.max(0, scaled);
+            total += pctMap[id];
+          });
+          var diff = Math.round((total - 100) * 100) / 100;
+          if (Math.abs(diff) >= 0.01) {
+            var adjustId = ids[ids.length - 1];
+            pctMap[adjustId] = Math.max(0, Math.round((pctMap[adjustId] - diff) * 100) / 100);
+          }
+        }
+      }
+
+      if (matchedAny && ids.length) {
+        var pushResp = pushRoutePercentages_(bucket.config, linkMap, pctMap);
+        var ok = pushResp.ok && pushResp.body && String(pushResp.body.status || '').toLowerCase() === 'success';
+        bucket.items.forEach(function(item){
+          var sent = item.percentualSugerido;
+          history.push(buildHistoryRow_(item, bucket.config, item.percentualSugerido, sent, ok ? 'ok' : 'erro', ok ? 'Sincronizado com sucesso.' : ('Falha API: HTTP ' + pushResp.code)));
+        });
+      }
+
+      saveLastSyncToRouteConfig_(bucket.config.id, new Date());
+    });
+  });
+
+  appendDistributionHistory_(history);
+  appendDistributionWarnings_(warnings);
+  return { ok: true, groups: distribution.groups, historyCount: history.length, warningCount: warnings.length, generatedAt: distribution.generatedAt };
+}
+
+function buildHistoryRow_(item, config, suggested, sent, status, message) {
+  return [
+    new Date(),
+    item.operacao || '',
+    item.suboperacao || '',
+    item.urlP1 || '',
+    config ? config.empresaId : '',
+    config ? config.dominioId : '',
+    config ? config.slugRota : '',
+    item.cpcCorrigido || 0,
+    item.requests || 0,
+    item.revenue || 0,
+    suggested != null ? suggested : '',
+    sent != null ? sent : '',
+    status || '',
+    message || ''
+  ];
+}
+
+function appendDistributionHistory_(rows) {
+  if (!rows || !rows.length) return;
+  var sh = ensureDistributionHistorySheet_();
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function appendDistributionWarnings_(rows) {
+  if (!rows || !rows.length) return;
+  var sh = ensureDistributionWarningsSheet_();
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function saveLastSyncToRouteConfig_(id, dateValue) {
+  var sh = ensureRouteConfigSheet_();
+  var values = sh.getDataRange().getValues();
+  var idx = getHeaderIndexMap_(values[0] || []);
+  for (var i = 1; i < values.length; i++) {
+    if (String(values[i][idx['ID']] || '') === String(id || '')) {
+      sh.getRange(i + 1, idx['Última Sincronização'] + 1).setValue(dateValue || new Date());
+      return;
+    }
+  }
+}
+
+function getDistributionHistory(limit) {
+  var sh = ensureDistributionHistorySheet_();
+  var values = sh.getDataRange().getValues();
+  if (values.length <= 1) return [];
+  var rows = values.slice(1).reverse();
+  if (limit) rows = rows.slice(0, Number(limit) || 100);
+  return rows;
+}
+
+function getDistributionWarnings(limit) {
+  var sh = ensureDistributionWarningsSheet_();
+  var values = sh.getDataRange().getValues();
+  if (values.length <= 1) return [];
+  var rows = values.slice(1).reverse();
+  if (limit) rows = rows.slice(0, Number(limit) || 100);
+  return rows;
+}
+
+function setupHourlyAutomationTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(function(t){
+    if (t.getHandlerFunction && t.getHandlerFunction() === AUTOMATION_HANDLER) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  ScriptApp.newTrigger(AUTOMATION_HANDLER).timeBased().everyHours(1).create();
+  return { ok: true };
+}
+
+function runHourlyAutomationSync() {
+  return syncCpcDistributionNow({});
+}
