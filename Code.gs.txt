@@ -1196,7 +1196,7 @@ function getRouteUrlsPreview(params) {
     return true;
   });
 
-  var urlToPage = {};
+  var urlToPages = {};
   var pagesSet = {};
   cfgRows.forEach(function(entry){
     var pageName = String(entry.pagina || '').trim();
@@ -1208,7 +1208,8 @@ function getRouteUrlsPreview(params) {
       (entry.urls || []).forEach(function(u){
         var normalized = normUrlStrict_(u);
         if (!normalized) return;
-        if (!urlToPage.hasOwnProperty(normalized)) urlToPage[normalized] = pageName;
+        if (!urlToPages[normalized]) urlToPages[normalized] = {};
+        urlToPages[normalized][pageName] = true;
       });
     }
   });
@@ -1226,11 +1227,7 @@ function getRouteUrlsPreview(params) {
   }
 
   var cpcCorrigidoByPage = {};
-  var selectedPages = [];
-  if (params.paginasSelecionadas && params.paginasSelecionadas.length) {
-    selectedPages = params.paginasSelecionadas.map(function(p){ return String(p || '').trim(); }).filter(Boolean);
-  }
-  if (!selectedPages.length) selectedPages = Object.keys(pagesSet);
+  var selectedPages = Object.keys(pagesSet);
 
   if (requestedPessoa && selectedPages.length) {
     var compare = (getDashboardData({
@@ -1285,8 +1282,15 @@ function getRouteUrlsPreview(params) {
   var rows = routeLinks.map(function(link){
     var normalized = normUrlStrict_(link.url || link.link || link.destination_url || '');
     if (!normalized) return null;
-    var pageName = urlToPage[normalized] || '';
-    var cpcCorrigido = pageName ? (cpcCorrigidoByPage[pageName] || 0) : 0;
+    var mappedPages = Object.keys(urlToPages[normalized] || {});
+    var pageName = mappedPages.length ? mappedPages[0] : '';
+    var cpcCorrigido = 0;
+    if (mappedPages.length) {
+      cpcCorrigido = mappedPages.reduce(function(max, page){
+        return Math.max(max, cpcCorrigidoByPage[page] || 0);
+      }, 0);
+      pageName = mappedPages.length > 1 ? mappedPages.join(' | ') : mappedPages[0];
+    }
     var suggested = suggestedByUrl[normalized] || { percentualSugerido: 0, eligible: false };
     return {
       url: normalized,
