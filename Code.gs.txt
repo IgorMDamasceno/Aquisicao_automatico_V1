@@ -985,6 +985,7 @@ if (!startDate && !endDate) {
 
 /* ============= ROTAS / DISTRIBUIÇÃO INTELIGENTE ============= */
 const ROUTE_CONFIG_SHEET = 'Rotas - API';
+const ROUTE_URL_MIN_SHEET = 'Rotas - Minimos URL';
 const DISTRIBUTION_HISTORY_SHEET = 'Historico - Distribuicao';
 const DISTRIBUTION_WARNINGS_SHEET = 'Avisos - Distribuicao';
 const AUTOMATION_HANDLER = 'runHourlyAutomationSync';
@@ -1135,6 +1136,70 @@ function listOperationsSuboperations() {
   return { operations: operations };
 }
 
+function ensureRouteUrlMinSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(ROUTE_URL_MIN_SHEET);
+  var headers = ['ID','Operação','Suboperação','URL','Min %'];
+  if (!sh) {
+    sh = ss.insertSheet(ROUTE_URL_MIN_SHEET);
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+    return sh;
+  }
+  var maxCol = Math.max(headers.length, sh.getLastColumn());
+  var current = sh.getRange(1,1,1,maxCol).getValues()[0];
+  var needs = false;
+  headers.forEach(function(h, i){ if (current[i] !== h) needs = true; });
+  if (needs) sh.getRange(1,1,1,headers.length).setValues([headers]);
+  return sh;
+}
+
+function listRouteUrlMinPercents() {
+  var sh = ensureRouteUrlMinSheet_();
+  var values = sh.getDataRange().getValues();
+  if (values.length <= 1) return [];
+  var idx = getHeaderIndexMap_(values[0]);
+  return values.slice(1).filter(function(r){
+    return String(r[idx['Operação']] || '').trim() && String(r[idx['Suboperação']] || '').trim() && String(r[idx['URL']] || '').trim();
+  }).map(function(r){
+    return {
+      id: String(r[idx['ID']] || ''),
+      operacao: String(r[idx['Operação']] || '').trim(),
+      suboperacao: String(r[idx['Suboperação']] || '').trim(),
+      url: normUrlStrict_(String(r[idx['URL']] || '').trim()),
+      minPercent: Math.max(0, toNumber_(r[idx['Min %']]))
+    };
+  }).filter(function(row){ return !!row.url; });
+}
+
+function saveRouteUrlMinPercent(payload) {
+  payload = payload || {};
+  var operacao = String(payload.operacao || '').trim();
+  var suboperacao = String(payload.suboperacao || '').trim();
+  var url = normUrlStrict_(String(payload.url || '').trim());
+  var minPercent = Math.max(0, toNumber_(payload.minPercent));
+  if (!operacao || !suboperacao || !url) throw new Error('Operação, suboperação e URL são obrigatórios.');
+
+  var sh = ensureRouteUrlMinSheet_();
+  var values = sh.getDataRange().getValues();
+  var idx = getHeaderIndexMap_(values[0] || []);
+  var opNorm = String(operacao || '').trim().toLowerCase();
+  var subNorm = String(suboperacao || '').trim().toLowerCase();
+
+  for (var i = 1; i < values.length; i++) {
+    var rowOp = String(values[i][idx['Operação']] || '').trim().toLowerCase();
+    var rowSub = String(values[i][idx['Suboperação']] || '').trim().toLowerCase();
+    var rowUrl = normUrlStrict_(String(values[i][idx['URL']] || '').trim());
+    if (rowOp === opNorm && rowSub === subNorm && rowUrl === url) {
+      sh.getRange(i + 1, idx['Min %'] + 1).setValue(minPercent);
+      return { ok: true };
+    }
+  }
+
+  sh.appendRow([Utilities.getUuid(), operacao, suboperacao, url, minPercent]);
+  return { ok: true };
+}
+
 function getRouteUrlsPreview(params) {
   params = params || {};
 
@@ -1151,6 +1216,18 @@ function getRouteUrlsPreview(params) {
     else if (s.indexOf(',') >= 0) s = s.replace(/,/g, '.');
     var n = parseFloat(s);
     return isNaN(n) ? 0 : n;
+  }
+
+  function minByUrlForGroup_(operacao, suboperacao) {
+    var map = {};
+    (listRouteUrlMinPercents() || []).forEach(function(item){
+      if (normText_(item.operacao) !== normText_(operacao)) return;
+      if (normText_(item.suboperacao) !== normText_(suboperacao)) return;
+      var normalized = normUrlStrict_(item.url || '');
+      if (!normalized) return;
+      map[normalized] = Math.max(0, toNumber_(item.minPercent));
+    });
+    return map;
   }
 
   var requestedPessoa = String(params.pessoa || '').trim();
@@ -1249,6 +1326,7 @@ function getRouteUrlsPreview(params) {
   });
 
   var suggestedByUrl = {};
+  var minByUrl = minByUrlForGroup_(requestedOp, requestedSub);
   var distPreview = calculateCpcDistribution({ operacao: requestedOp, suboperacao: requestedSub });
   var distGroups = (distPreview && distPreview.groups) ? distPreview.groups : [];
   distGroups.forEach(function(group){
@@ -1257,7 +1335,8 @@ function getRouteUrlsPreview(params) {
       if (!normalizedUrl) return;
       suggestedByUrl[normalizedUrl] = {
         percentualSugerido: toNumber_(item.percentualSugerido || 0),
-        eligible: !!item.eligible
+        eligible: !!item.eligible,
+        minPercent: Math.max(0, toNumber_(item.minPercent || 0))
       };
     });
   });
@@ -1298,6 +1377,7 @@ function getRouteUrlsPreview(params) {
       pagina: pageName,
       cpcCorrigido: cpcCorrigido,
       percentualSugerido: suggested.eligible ? suggested.percentualSugerido : 0,
+      minPercent: minByUrl.hasOwnProperty(normalized) ? minByUrl[normalized] : (suggested.minPercent || 0),
       eligible: suggested.eligible
     };
   }).filter(function(row){ return !!row; });
@@ -1423,6 +1503,14 @@ function calculateCpcDistribution(params) {
 
   var routeByKey = {};
   var groupLabelByKey = {};
+  var routeUrlMinMapByKey = {};
+  (listRouteUrlMinPercents() || []).forEach(function(item){
+    var key = keyFor_(item.operacao, item.suboperacao);
+    if (!routeUrlMinMapByKey[key]) routeUrlMinMapByKey[key] = {};
+    var normalized = normUrlStrict_(item.url || '');
+    if (!normalized) return;
+    routeUrlMinMapByKey[key][normalized] = Math.max(0, toNumber_(item.minPercent));
+  });
   routeConfigs.forEach(function(rc){
     var key = keyFor_(rc.operacao, rc.suboperacao);
     routeByKey[key] = rc;
@@ -1594,6 +1682,7 @@ function calculateCpcDistribution(params) {
   Object.keys(groupsMap).forEach(function(groupKey){
     var group = groupsMap[groupKey];
     var routeCfg = routeByKey[groupKey] || null;
+    var routeUrlMinMap = routeUrlMinMapByKey[groupKey] || {};
     var routeUrlsSet = routeUrlsByGroup[groupKey] || {};
     var localUrlsSet = localUrlsByGroup[groupKey] || {};
     var localUrlPageMap = localUrlPageByGroup[groupKey] || {};
@@ -1629,6 +1718,7 @@ function calculateCpcDistribution(params) {
         routeConfig: routeCfg,
         eligible: reasons.length === 0,
         exclusionReasons: reasons,
+        minPercent: routeUrlMinMap.hasOwnProperty(url) ? routeUrlMinMap[url] : (routeCfg ? Math.max(0, toNumber_(routeCfg.minPercent)) : 0),
         percentualSugerido: 0,
         percentualAtualRota: routeCurrentPct.hasOwnProperty(url) ? routeCurrentPct[url] : null,
         diferencaPercentual: null
@@ -1642,7 +1732,7 @@ function calculateCpcDistribution(params) {
       return {
         url: c.urlP1,
         cpcCorrigido: c.cpcCorrigido,
-        minPercent: minP,
+        minPercent: c.minPercent != null ? c.minPercent : minP,
         maxPercent: maxP,
         eligible: c.eligible
       };
@@ -1660,6 +1750,7 @@ function calculateCpcDistribution(params) {
       var normalizedUrl = normUrlStrict_(c.urlP1 || '');
       var result = normalizedUrl ? softmaxByUrl[normalizedUrl] : null;
       c.percentualSugerido = result ? result.finalPercent : 0;
+      c.minPercent = result ? result.minPercent : c.minPercent;
     });
 
     candidates.forEach(function(c){
