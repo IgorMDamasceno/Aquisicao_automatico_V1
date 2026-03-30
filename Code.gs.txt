@@ -989,6 +989,7 @@ const DISTRIBUTION_HISTORY_SHEET = 'Historico - Distribuicao';
 const DISTRIBUTION_WARNINGS_SHEET = 'Avisos - Distribuicao';
 const AUTOMATION_HANDLER = 'runHourlyAutomationSync';
 const DISTRIBUTION_DEFAULT_LIMITS = { minPercent: 0, maxPercent: 100 };
+const DISTRIBUTION_SOFTMAX_ALPHA = 40;
 const LINK_ROUTER_BASE_URL = 'https://rotasv2.spun.com.br';
 const LINK_ROUTER_TOKEN = '1|crewZvM3pCrHsz9gwWVfzyzQ5IrTk0T7gltREA4d67dc7105';
 
@@ -1311,6 +1312,76 @@ function getRouteUrlsPreview(params) {
   };
 }
 
+function calculateNormalizedSoftmaxDistribution(urls, alpha) {
+  var safeAlpha = isFinite(alpha) ? Number(alpha) : DISTRIBUTION_SOFTMAX_ALPHA;
+  if (!isFinite(safeAlpha) || safeAlpha <= 0) safeAlpha = DISTRIBUTION_SOFTMAX_ALPHA;
+
+  var items = (urls || []).map(function(u, idx){
+    var cpc = toNumber_(u.cpcCorrigido);
+    var minP = Math.max(0, toNumber_(u.minPercent));
+    var maxP = Math.min(100, toNumber_(u.maxPercent) || 100);
+    if (maxP < minP) maxP = minP;
+    return {
+      index: idx,
+      url: u.url,
+      cpcCorrigido: cpc,
+      eligible: !!u.eligible && isFinite(cpc) && cpc > 0,
+      minPercent: minP,
+      maxPercent: maxP,
+      score: 0,
+      weight: 0,
+      softmaxPercent: 0,
+      finalPercent: 0
+    };
+  });
+
+  var eligible = items.filter(function(i){ return i.eligible; });
+  if (!eligible.length) return items;
+
+  var bestCpc = eligible.reduce(function(max, i){ return Math.max(max, i.cpcCorrigido); }, 0);
+  if (!(bestCpc > 0)) return items;
+
+  eligible.forEach(function(i){ i.score = i.cpcCorrigido / bestCpc; });
+
+  var maxScore = eligible.reduce(function(max, i){ return Math.max(max, i.score); }, -Infinity);
+  eligible.forEach(function(i){ i.weight = Math.exp((i.score - maxScore) * safeAlpha); });
+
+  var weightSum = eligible.reduce(function(sum, i){ return sum + i.weight; }, 0);
+  if (!(weightSum > 0)) {
+    var uniform = 100 / eligible.length;
+    eligible.forEach(function(i){ i.softmaxPercent = uniform; });
+  } else {
+    eligible.forEach(function(i){ i.softmaxPercent = (i.weight / weightSum) * 100; });
+  }
+
+  var minSum = eligible.reduce(function(sum, i){ return sum + i.minPercent; }, 0);
+  if (minSum > 100) {
+    var factor = 100 / minSum;
+    eligible.forEach(function(i){ i.minPercent = i.minPercent * factor; });
+    minSum = 100;
+  }
+  var remaining = Math.max(0, 100 - minSum);
+
+  eligible.forEach(function(i){
+    var blended = i.minPercent + (i.softmaxPercent * remaining / 100);
+    i.finalPercent = Math.max(i.minPercent, Math.min(i.maxPercent, blended));
+  });
+
+  var finalSum = eligible.reduce(function(sum, i){ return sum + i.finalPercent; }, 0);
+  if (finalSum > 0) {
+    eligible.forEach(function(i){ i.finalPercent = (i.finalPercent / finalSum) * 100; });
+  }
+
+  var adjustedSum = eligible.reduce(function(sum, i){ return sum + i.finalPercent; }, 0);
+  var roundingDelta = 100 - adjustedSum;
+  if (eligible.length) {
+    eligible[eligible.length - 1].finalPercent += roundingDelta;
+    if (eligible[eligible.length - 1].finalPercent < 0) eligible[eligible.length - 1].finalPercent = 0;
+  }
+
+  return items;
+}
+
 function calculateCpcDistribution(params) {
   params = params || {};
 
@@ -1560,27 +1631,32 @@ function calculateCpcDistribution(params) {
       };
     });
 
-    var eligible = candidates.filter(function(c){ return c.eligible; });
-    if (!eligible.length) {
-      candidates.forEach(function(c){ c.percentualSugerido = 0; });
-    } else if (eligible.length === 1) {
-      eligible[0].percentualSugerido = 100;
-    } else {
-      var totalCpc = eligible.reduce(function(acc, c){ return acc + Math.max(0, c.cpcCorrigido); }, 0);
-      if (totalCpc <= 0) {
-        eligible.forEach(function(c){ c.percentualSugerido = 0; c.exclusionReasons.push('Divisão por zero evitada (CPC total).'); c.eligible = false; });
-      } else {
-        eligible.forEach(function(c){
-          var raw = (Math.max(0, c.cpcCorrigido) / totalCpc) * 100;
-          var minP = c.routeConfig ? Math.max(0, toNumber_(c.routeConfig.minPercent)) : 0;
-          var maxP = c.routeConfig ? Math.min(100, toNumber_(c.routeConfig.maxPercent) || 100) : 100;
-          if (maxP < minP) maxP = minP;
-          c.percentualSugerido = Math.min(maxP, Math.max(minP, raw));
-        });
-        var sum = eligible.reduce(function(acc, c){ return acc + c.percentualSugerido; }, 0);
-        if (sum > 0) eligible.forEach(function(c){ c.percentualSugerido = (c.percentualSugerido / sum) * 100; });
-      }
-    }
+    var softmaxInput = candidates.map(function(c){
+      var minP = c.routeConfig ? Math.max(0, toNumber_(c.routeConfig.minPercent)) : 0;
+      var maxP = c.routeConfig ? Math.min(100, toNumber_(c.routeConfig.maxPercent) || 100) : 100;
+      if (maxP < minP) maxP = minP;
+      return {
+        url: c.urlP1,
+        cpcCorrigido: c.cpcCorrigido,
+        minPercent: minP,
+        maxPercent: maxP,
+        eligible: c.eligible
+      };
+    });
+
+    var softmaxResults = calculateNormalizedSoftmaxDistribution(softmaxInput, DISTRIBUTION_SOFTMAX_ALPHA);
+    var softmaxByUrl = {};
+    softmaxResults.forEach(function(r){
+      var normalizedUrl = normUrlStrict_(r.url || '');
+      if (!normalizedUrl) return;
+      softmaxByUrl[normalizedUrl] = r;
+    });
+
+    candidates.forEach(function(c){
+      var normalizedUrl = normUrlStrict_(c.urlP1 || '');
+      var result = normalizedUrl ? softmaxByUrl[normalizedUrl] : null;
+      c.percentualSugerido = result ? result.finalPercent : 0;
+    });
 
     candidates.forEach(function(c){
       if (c.percentualAtualRota != null) c.diferencaPercentual = c.percentualSugerido - c.percentualAtualRota;
