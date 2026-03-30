@@ -1438,30 +1438,86 @@ function calculateNormalizedSoftmaxDistribution(urls, alpha) {
     eligible.forEach(function(i){ i.softmaxPercent = (i.weight / weightSum) * 100; });
   }
 
-  var minSum = eligible.reduce(function(sum, i){ return sum + i.minPercent; }, 0);
-  if (minSum > 100) {
-    var factor = 100 / minSum;
-    eligible.forEach(function(i){ i.minPercent = i.minPercent * factor; });
-    minSum = 100;
-  }
-  var remaining = Math.max(0, 100 - minSum);
-
+  // Regra de mínimo como piso (não deve interferir quando softmax já é maior que o mínimo).
+  // Apenas URLs com softmax abaixo do mínimo são travadas no mínimo; o restante é reescalado.
   eligible.forEach(function(i){
-    var blended = i.minPercent + (i.softmaxPercent * remaining / 100);
-    i.finalPercent = Math.max(i.minPercent, Math.min(i.maxPercent, blended));
+    i.finalPercent = i.softmaxPercent;
+    i.lockedByMin = false;
   });
 
-  var finalSum = eligible.reduce(function(sum, i){ return sum + i.finalPercent; }, 0);
-  if (finalSum > 0) {
-    eligible.forEach(function(i){ i.finalPercent = (i.finalPercent / finalSum) * 100; });
+  var guard = 0;
+  while (guard < 20) {
+    guard++;
+    var fixedSum = 0;
+    var open = [];
+    eligible.forEach(function(i){
+      if (i.lockedByMin) fixedSum += i.finalPercent;
+      else open.push(i);
+    });
+
+    var remaining = Math.max(0, 100 - fixedSum);
+    var openSoftmaxSum = open.reduce(function(sum, i){ return sum + i.softmaxPercent; }, 0);
+    open.forEach(function(i){
+      i.finalPercent = openSoftmaxSum > 0 ? (i.softmaxPercent / openSoftmaxSum) * remaining : 0;
+    });
+
+    var changed = false;
+    open.forEach(function(i){
+      if (i.finalPercent < i.minPercent) {
+        i.finalPercent = i.minPercent;
+        i.lockedByMin = true;
+        changed = true;
+      }
+    });
+    if (!changed) break;
   }
 
-  var adjustedSum = eligible.reduce(function(sum, i){ return sum + i.finalPercent; }, 0);
-  var roundingDelta = 100 - adjustedSum;
-  if (eligible.length) {
-    eligible[eligible.length - 1].finalPercent += roundingDelta;
-    if (eligible[eligible.length - 1].finalPercent < 0) eligible[eligible.length - 1].finalPercent = 0;
+  // Se soma dos mínimos for > 100, limita para 100 proporcionalmente.
+  var finalSumPreCap = eligible.reduce(function(sum, i){ return sum + i.finalPercent; }, 0);
+  if (finalSumPreCap > 100 && finalSumPreCap > 0) {
+    var capFactor = 100 / finalSumPreCap;
+    eligible.forEach(function(i){ i.finalPercent = i.finalPercent * capFactor; });
   }
+
+  // Aplica máximo após piso.
+  eligible.forEach(function(i){
+    i.finalPercent = Math.min(i.maxPercent, i.finalPercent);
+    if (i.finalPercent < 0) i.finalPercent = 0;
+  });
+
+  // Renormaliza para 100 antes de arredondar.
+  var normalizedSum = eligible.reduce(function(sum, i){ return sum + i.finalPercent; }, 0);
+  if (normalizedSum > 0) {
+    eligible.forEach(function(i){ i.finalPercent = (i.finalPercent / normalizedSum) * 100; });
+  }
+
+  // Inteiros que fecham 100 (maiores restos recebem +1).
+  var intBaseSum = 0;
+  eligible.forEach(function(i){
+    var floored = Math.floor(i.finalPercent);
+    i._intBase = floored;
+    i._remainder = i.finalPercent - floored;
+    intBaseSum += floored;
+  });
+  var toDistribute = 100 - intBaseSum;
+  if (toDistribute > 0) {
+    var ranked = eligible.slice().sort(function(a, b){ return b._remainder - a._remainder; });
+    for (var k = 0; k < ranked.length && toDistribute > 0; k++, toDistribute--) ranked[k]._intBase += 1;
+  } else if (toDistribute < 0) {
+    var rankedDesc = eligible.slice().sort(function(a, b){ return a._remainder - b._remainder; });
+    for (var j = 0; j < rankedDesc.length && toDistribute < 0; j++) {
+      if (rankedDesc[j]._intBase > 0) {
+        rankedDesc[j]._intBase -= 1;
+        toDistribute++;
+      }
+    }
+  }
+  eligible.forEach(function(i){
+    i.finalPercent = i._intBase;
+    delete i._intBase;
+    delete i._remainder;
+    delete i.lockedByMin;
+  });
 
   return items;
 }
