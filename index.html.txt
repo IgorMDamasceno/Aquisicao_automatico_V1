@@ -1152,7 +1152,7 @@ function todayIso(){
       if (subAna && subComp && subDist) {
         subAna.onclick = function(){ setDashSubTab('ana'); };
         subComp.onclick = function(){ setDashSubTab('comp'); };
-        subDist.onclick = function(){ setDashSubTab('dist'); if (window.LAST_DASH_FILTERS) loadDistributionIntelligence(window.LAST_DASH_FILTERS); };
+        subDist.onclick = function(){ setDashSubTab('dist'); loadDistributionIntelligence(window.LAST_DASH_FILTERS || null); };
       }
       setDashSubTab('ana');
     })();
@@ -3098,39 +3098,70 @@ function todayIso(){
     }
 
     function loadDistributionIntelligence(filters){
-      var op = filters && filters.operacao ? filters.operacao : '';
-      var sub = filters && filters.suboperacao ? filters.suboperacao : '';
+      var selectedOp = (filters && filters.operacao) ? filters.operacao : (FILTRO_OPERACAO && FILTRO_OPERACAO.selected ? FILTRO_OPERACAO.selected : '');
+      var selectedSub = (filters && filters.suboperacao) ? filters.suboperacao : (FILTRO_SUBOPERACAO && FILTRO_SUBOPERACAO.selected ? FILTRO_SUBOPERACAO.selected : '');
       var container = byId('dist-summary');
       var historyTb = byId('dist-history');
-      if (!op || !sub) {
-        if (container) container.innerHTML = '<div class="card rounded-2xl p-6 text-slate-400">Selecione Operação e Suboperação e clique em Aplicar Filtros para liberar esta visão.</div>';
-        if (historyTb) historyTb.innerHTML = '<tr><td class="text-slate-400">Sem histórico.</td></tr>';
-        return;
+
+      if (container) {
+        container.innerHTML = '<div class="card rounded-2xl p-6 text-slate-400">Carregando URLs da API de rotas...</div>';
       }
-      google.script.run.withSuccessHandler(function(res){
-        var container = byId('dist-summary');
-        if (!container) return;
-        var groups = (res && res.groups) ? res.groups : [];
-        if (!groups.length) {
-          var diag = (res && res.diagnostics) ? res.diagnostics : {};
-          var filtros = diag.filtros || {};
-          var routeApi = diag.routeApi || {};
-          var detalhe = 'Filtros => Operação: ' + escapeHtml(String(filtros.operacao || '')) + ' | Suboperação: ' + escapeHtml(String(filtros.suboperacao || ''))
-            + '<br>API rota configurada: ' + (routeApi.configured ? 'Sim' : 'Não')
-            + ' | Base URL: ' + escapeHtml(String(routeApi.baseUrl || ''))
-            + '<br>Configurações de rota encontradas: ' + escapeHtml(String(diag.routeConfigsEncontradas || 0)) + ' (total: ' + escapeHtml(String(diag.routeConfigsTotais || 0)) + ')'
-            + ' | Entradas P1 locais encontradas: ' + escapeHtml(String(diag.p1LocaisEncontradas || 0)) + ' (total: ' + escapeHtml(String(diag.p1LocaisTotais || 0)) + ')';
-          container.innerHTML = '<div class="card rounded-2xl p-6 text-slate-400">Nenhuma suboperação com URLs P1 elegíveis.<br><span class="text-xs">' + detalhe + '</span></div>';
+
+      google.script.run.withSuccessHandler(function(preview){
+        var target = byId('dist-summary');
+        if (!target) return;
+
+        if (!preview || !preview.ok) {
+          var msg = preview && preview.message ? preview.message : 'Não foi possível carregar URLs da API de rotas.';
+          target.innerHTML = '<div class="card rounded-2xl p-6 text-slate-400">'+escapeHtml(msg)+'</div>';
           return;
         }
-        container.innerHTML = groups.map(function(g){
-          var rows = (g.urls || []).map(function(u){
-            var warn = (u.exclusionReasons||[]).join('; ');
-            return '<tr class="border-t border-slate-700/60"><td class="py-2 px-2 mono text-xs">'+escapeHtml(u.urlP1||'')+'</td><td class="py-2 px-2 text-right">'+num(u.cpcCorrigido||0,4)+'</td><td class="py-2 px-2 text-right">'+num(u.requests||0,0)+'</td><td class="py-2 px-2 text-right">'+money(u.revenue||0,2)+'</td><td class="py-2 px-2 text-right">'+pct(u.percentualSugerido||0,2)+'</td><td class="py-2 px-2 text-right">'+(u.percentualAtualRota==null?'—':pct(u.percentualAtualRota,2))+'</td><td class="py-2 px-2 text-right">'+(u.diferencaPercentual==null?'—':pct(u.diferencaPercentual,2))+'</td><td class="py-2 px-2">'+(u.eligible?'Ativa':'Excluída')+'</td><td class="py-2 px-2 text-xs text-amber-300">'+escapeHtml(warn)+'</td></tr>';
-          }).join('');
-          return '<div class="card rounded-2xl p-4"><div class="flex items-center justify-between"><h3 class="font-semibold text-slate-100">'+escapeHtml(g.operacao)+' / '+escapeHtml(g.suboperacao)+'</h3><span class="text-xs text-slate-400">Última sync: '+escapeHtml(g.ultimaSincronizacao||'—')+'</span></div><div class="overflow-auto mt-3"><table class="w-full text-sm"><thead class="text-slate-400"><tr><th class="text-left py-2 px-2">URL P1</th><th class="text-right py-2 px-2">CPC Corrigido</th><th class="text-right py-2 px-2">Solicitações</th><th class="text-right py-2 px-2">Receita</th><th class="text-right py-2 px-2">% Sugerido</th><th class="text-right py-2 px-2">% Atual</th><th class="text-right py-2 px-2">Dif.</th><th class="text-left py-2 px-2">Status</th><th class="text-left py-2 px-2">Avisos</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+
+        var routeRows = (preview.rows || []).map(function(row){
+          var minVal = Number(row.minPercent || 0);
+          if (!isFinite(minVal) || minVal < 0) minVal = 0;
+          return '<tr class="border-t border-slate-700/60"><td class="py-2 px-2 mono text-xs">'+escapeHtml(row.url||'')+'</td><td class="py-2 px-2">'+escapeHtml(row.pagina||'—')+'</td><td class="py-2 px-2 text-right">'+pct(row.percentualAtual||0,2)+'</td><td class="py-2 px-2 text-right">'+pct(row.percentualSugerido||0,2)+'</td><td class="py-2 px-2 text-right">'+money(row.cpcCorrigido||0,3)+'</td><td class="py-2 px-2 text-right"><input type="number" min="0" step="0.01" value="'+escapeHtml(String(minVal.toFixed(2)))+'" class="w-24 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-right text-xs" data-route-min-url="'+escapeHtml(row.url||'')+'"></td></tr>';
         }).join('');
-      }).calculateCpcDistribution({ operacao: (filters && filters.operacao) || '', suboperacao: (filters && filters.suboperacao) || '' });
+
+        if (!routeRows) routeRows = '<tr><td class="py-2 px-2 text-slate-400" colspan="6">Nenhuma URL retornada pela API de rotas.</td></tr>';
+
+        target.innerHTML = '<div class="card rounded-2xl p-4">'
+          + '<div class="flex items-center justify-between">'
+          + '<h3 class="font-semibold text-slate-100">'+escapeHtml(selectedOp)+' / '+escapeHtml(selectedSub)+'</h3>'
+          + '<span class="text-xs text-slate-400">URLs coletadas da API de rotas</span>'
+          + '</div>'
+          + '<div class="overflow-auto mt-3">'
+          + '<table class="w-full text-sm"><thead class="text-slate-400"><tr><th class="text-left py-2 px-2">URL</th><th class="text-left py-2 px-2">Página de Queda</th><th class="text-right py-2 px-2">% tráfego atual</th><th class="text-right py-2 px-2">% tráfego sugerida</th><th class="text-right py-2 px-2">CPC Corrigido</th><th class="text-right py-2 px-2">% tráfego mínimo</th></tr></thead><tbody>' + routeRows + '</tbody></table>'
+          + '</div>'
+          + '</div>';
+
+        target.querySelectorAll('[data-route-min-url]').forEach(function(input){
+          input.addEventListener('change', function(){
+            var raw = parseFloat(input.value);
+            var minPercent = isFinite(raw) && raw >= 0 ? raw : 0;
+            var routeUrl = input.getAttribute('data-route-min-url') || '';
+            google.script.run
+              .withSuccessHandler(function(){
+                showToast('Tráfego mínimo salvo.', 'success');
+                loadDistributionIntelligence(window.LAST_DASH_FILTERS || filters || null);
+              })
+              .withFailureHandler(function(err){
+                showToast(err && err.message ? err.message : 'Falha ao salvar tráfego mínimo.', 'error');
+              })
+              .saveRouteUrlMinPercent({ operacao: selectedOp, suboperacao: selectedSub, url: routeUrl, minPercent: minPercent });
+          });
+        });
+      }).withFailureHandler(function(err){
+        var target = byId('dist-summary');
+        if (!target) return;
+        var message = err && err.message ? err.message : 'Falha ao carregar URLs da API de rotas.';
+        target.innerHTML = '<div class="card rounded-2xl p-6 text-slate-400">'+escapeHtml(message)+'</div>';
+      }).getRouteUrlsPreview({ operacao: selectedOp, suboperacao: selectedSub, pessoa: (filters && filters.pessoa) || (FILTRO_PESSOA && FILTRO_PESSOA.selected ? FILTRO_PESSOA.selected : ''), paginasSelecionadas: (filters && filters.paginasSelecionadas && filters.paginasSelecionadas.slice) ? filters.paginasSelecionadas.slice() : (PQ && PQ.selected ? PQ.selected.slice() : []), startDate: (filters && filters.startDate) || (byId('f-start') ? byId('f-start').value : ''), endDate: (filters && filters.endDate) || (byId('f-end') ? byId('f-end').value : ''), granularity: (filters && filters.granularity) || (byId('f-gran') ? byId('f-gran').value : 'hour') });
+
+      if (!selectedOp || !selectedSub) {
+        if (historyTb) historyTb.innerHTML = '<tr><td class="text-slate-400">Selecione Operação e Suboperação para consultar o histórico.</td></tr>';
+        return;
+      }
 
       google.script.run.withSuccessHandler(function(rows){
         var tb = byId('dist-history');

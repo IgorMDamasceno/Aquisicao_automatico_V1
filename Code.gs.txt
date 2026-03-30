@@ -985,10 +985,13 @@ if (!startDate && !endDate) {
 
 /* ============= ROTAS / DISTRIBUIÇÃO INTELIGENTE ============= */
 const ROUTE_CONFIG_SHEET = 'Rotas - API';
+const ROUTE_URL_MIN_SHEET = 'Rotas - Minimos URL';
+const DISTRIBUTION_DIAG_STATE_SHEET = 'Estado - Diagnostico URL';
 const DISTRIBUTION_HISTORY_SHEET = 'Historico - Distribuicao';
 const DISTRIBUTION_WARNINGS_SHEET = 'Avisos - Distribuicao';
 const AUTOMATION_HANDLER = 'runHourlyAutomationSync';
 const DISTRIBUTION_DEFAULT_LIMITS = { minPercent: 0, maxPercent: 100 };
+const DISTRIBUTION_SOFTMAX_ALPHA = 40;
 const LINK_ROUTER_BASE_URL = 'https://rotasv2.spun.com.br';
 const LINK_ROUTER_TOKEN = '1|crewZvM3pCrHsz9gwWVfzyzQ5IrTk0T7gltREA4d67dc7105';
 
@@ -1134,6 +1137,534 @@ function listOperationsSuboperations() {
   return { operations: operations };
 }
 
+function ensureDistributionDiagnosisStateSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(DISTRIBUTION_DIAG_STATE_SHEET);
+  var headers = ['Chave','Operação','Suboperação','URL P1','Último Status','Último Status Base','Contador Consecutivo','Última Ocorrência'];
+  if (!sh) {
+    sh = ss.insertSheet(DISTRIBUTION_DIAG_STATE_SHEET);
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+    return sh;
+  }
+  var maxCol = Math.max(headers.length, sh.getLastColumn());
+  var current = sh.getRange(1,1,1,maxCol).getValues()[0];
+  var needs = false;
+  headers.forEach(function(h, i){ if (current[i] !== h) needs = true; });
+  if (needs) sh.getRange(1,1,1,headers.length).setValues([headers]);
+  return sh;
+}
+
+function makeDiagStateKey_(operacao, suboperacao, urlP1) {
+  return String(operacao || '').trim().toLowerCase() + '||' + String(suboperacao || '').trim().toLowerCase() + '||' + normUrlStrict_(urlP1 || '');
+}
+
+function loadDistributionDiagnosisStateMap_() {
+  var sh = ensureDistributionDiagnosisStateSheet_();
+  var values = sh.getDataRange().getValues();
+  if (values.length <= 1) return {};
+  var idx = getHeaderIndexMap_(values[0]);
+  var map = {};
+  values.slice(1).forEach(function(r, i){
+    var key = String(r[idx['Chave']] || '').trim();
+    if (!key) return;
+    map[key] = {
+      rowIndex: i + 2,
+      key: key,
+      operacao: String(r[idx['Operação']] || '').trim(),
+      suboperacao: String(r[idx['Suboperação']] || '').trim(),
+      urlP1: String(r[idx['URL P1']] || '').trim(),
+      ultimoStatus: String(r[idx['Último Status']] || '').trim(),
+      ultimoStatusBase: String(r[idx['Último Status Base']] || '').trim(),
+      contadorConsecutivo: Math.max(0, parseInt(r[idx['Contador Consecutivo']], 10) || 0),
+      ultimaOcorrencia: r[idx['Última Ocorrência']] || ''
+    };
+  });
+  return map;
+}
+
+function saveDistributionDiagnosisStateMap_(updates) {
+  var keys = Object.keys(updates || {});
+  if (!keys.length) return;
+  var sh = ensureDistributionDiagnosisStateSheet_();
+  var values = sh.getDataRange().getValues();
+  var idx = getHeaderIndexMap_(values[0] || []);
+  var existing = {};
+  values.slice(1).forEach(function(r, i){
+    var key = String(r[idx['Chave']] || '').trim();
+    if (key) existing[key] = i + 2;
+  });
+
+  keys.forEach(function(key){
+    var state = updates[key];
+    var row = [
+      key,
+      state.operacao || '',
+      state.suboperacao || '',
+      state.urlP1 || '',
+      state.ultimoStatus || '',
+      state.ultimoStatusBase || '',
+      state.contadorConsecutivo || 0,
+      state.ultimaOcorrencia || new Date()
+    ];
+    if (existing[key]) sh.getRange(existing[key], 1, 1, row.length).setValues([row]);
+    else sh.appendRow(row);
+  });
+}
+
+function buildOperationalDiagnosis_(candidate, groupContext, persistedState) {
+  var percentualReferencia = candidate.percentualAtualRota != null ? toNumber_(candidate.percentualAtualRota) : toNumber_(candidate.percentualSugerido);
+  if (!isFinite(percentualReferencia) || percentualReferencia < 0) percentualReferencia = 0;
+  var requestsEsperados = toNumber_(groupContext.requestsTotaisGrupo) * (percentualReferencia / 100);
+  var status = 'OK';
+  var mensagem = '';
+  var shouldAlert = false;
+  var shouldAct = false;
+  var statusBase = 'OK';
+  var contadorPersistencia = 0;
+
+  if (toNumber_(groupContext.requestsTotaisGrupo) <= 0) {
+    status = 'OPERACAO_SEM_TRAFEGO';
+    statusBase = status;
+    mensagem = 'Operação sem tráfego no período analisado; nenhuma ação tomada.';
+  } else if (percentualReferencia < 5 || requestsEsperados < 10) {
+    status = 'AMOSTRA_INSUFICIENTE';
+    statusBase = status;
+    mensagem = 'URL com percentual baixo ou amostra insuficiente; aguardando mais dados antes de agir.';
+  } else if (toNumber_(candidate.requests) >= 50 && toNumber_(candidate.revenue) <= 0) {
+    status = 'SUSPEITA_SEM_RECEITA';
+    statusBase = status;
+    shouldAlert = true;
+    mensagem = 'URL com requests relevantes, mas sem receita; possível problema de monetização.';
+  } else if (percentualReferencia >= 10 && requestsEsperados >= 10 && toNumber_(candidate.requests) === 0) {
+    status = 'SUSPEITA_SEM_TRAFEGO';
+    statusBase = status;
+    shouldAlert = true;
+    mensagem = 'URL deveria estar recebendo tráfego, mas está sem requests nesta janela.';
+  } else {
+    status = 'OK';
+    statusBase = status;
+    mensagem = 'URL operando dentro dos parâmetros esperados.';
+  }
+
+  var prevBase = String((persistedState && persistedState.ultimoStatusBase) || '').trim();
+  var prevCount = Math.max(0, parseInt((persistedState && persistedState.contadorConsecutivo) || 0, 10) || 0);
+  if (statusBase === 'SUSPEITA_SEM_TRAFEGO' || statusBase === 'SUSPEITA_SEM_RECEITA') {
+    contadorPersistencia = (prevBase === statusBase) ? (prevCount + 1) : 1;
+    if (contadorPersistencia >= 3) {
+      status = 'PROBLEMA_CONFIRMADO';
+      shouldAlert = true;
+      shouldAct = true;
+      mensagem = 'Problema confirmado após múltiplas execuções consecutivas; URL removida da elegibilidade.';
+    } else if (contadorPersistencia === 2) {
+      mensagem += ' (2ª ocorrência consecutiva)';
+    } else {
+      mensagem += ' (1ª ocorrência consecutiva)';
+    }
+  } else {
+    contadorPersistencia = 0;
+    shouldAlert = false;
+    shouldAct = false;
+  }
+
+  return {
+    status: status,
+    statusBase: statusBase,
+    mensagem: mensagem,
+    shouldAlert: shouldAlert,
+    shouldAct: shouldAct,
+    contadorPersistencia: contadorPersistencia,
+    percentualReferencia: percentualReferencia,
+    requestsEsperados: requestsEsperados
+  };
+}
+
+function ensureRouteUrlMinSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(ROUTE_URL_MIN_SHEET);
+  var headers = ['ID','Operação','Suboperação','URL','Min %'];
+  if (!sh) {
+    sh = ss.insertSheet(ROUTE_URL_MIN_SHEET);
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+    return sh;
+  }
+  var maxCol = Math.max(headers.length, sh.getLastColumn());
+  var current = sh.getRange(1,1,1,maxCol).getValues()[0];
+  var needs = false;
+  headers.forEach(function(h, i){ if (current[i] !== h) needs = true; });
+  if (needs) sh.getRange(1,1,1,headers.length).setValues([headers]);
+  return sh;
+}
+
+function listRouteUrlMinPercents() {
+  var sh = ensureRouteUrlMinSheet_();
+  var values = sh.getDataRange().getValues();
+  if (values.length <= 1) return [];
+  var idx = getHeaderIndexMap_(values[0]);
+  return values.slice(1).filter(function(r){
+    return String(r[idx['Operação']] || '').trim() && String(r[idx['Suboperação']] || '').trim() && String(r[idx['URL']] || '').trim();
+  }).map(function(r){
+    return {
+      id: String(r[idx['ID']] || ''),
+      operacao: String(r[idx['Operação']] || '').trim(),
+      suboperacao: String(r[idx['Suboperação']] || '').trim(),
+      url: normUrlStrict_(String(r[idx['URL']] || '').trim()),
+      minPercent: Math.max(0, toNumber_(r[idx['Min %']]))
+    };
+  }).filter(function(row){ return !!row.url; });
+}
+
+function saveRouteUrlMinPercent(payload) {
+  payload = payload || {};
+  var operacao = String(payload.operacao || '').trim();
+  var suboperacao = String(payload.suboperacao || '').trim();
+  var url = normUrlStrict_(String(payload.url || '').trim());
+  var minPercent = Math.max(0, toNumber_(payload.minPercent));
+  if (!operacao || !suboperacao || !url) throw new Error('Operação, suboperação e URL são obrigatórios.');
+
+  var sh = ensureRouteUrlMinSheet_();
+  var values = sh.getDataRange().getValues();
+  var idx = getHeaderIndexMap_(values[0] || []);
+  var opNorm = String(operacao || '').trim().toLowerCase();
+  var subNorm = String(suboperacao || '').trim().toLowerCase();
+
+  for (var i = 1; i < values.length; i++) {
+    var rowOp = String(values[i][idx['Operação']] || '').trim().toLowerCase();
+    var rowSub = String(values[i][idx['Suboperação']] || '').trim().toLowerCase();
+    var rowUrl = normUrlStrict_(String(values[i][idx['URL']] || '').trim());
+    if (rowOp === opNorm && rowSub === subNorm && rowUrl === url) {
+      sh.getRange(i + 1, idx['Min %'] + 1).setValue(minPercent);
+      return { ok: true };
+    }
+  }
+
+  sh.appendRow([Utilities.getUuid(), operacao, suboperacao, url, minPercent]);
+  return { ok: true };
+}
+
+function getRouteUrlsPreview(params) {
+  params = params || {};
+
+  function normText_(value) {
+    return String(value || '').trim().toLowerCase();
+  }
+
+  function parseRoutePercent_(value) {
+    if (typeof value === 'number') return isFinite(value) ? value : 0;
+    var s = String(value || '').trim();
+    if (!s) return 0;
+    s = s.replace(/%/g, '').replace(/\s/g, '');
+    if (s.indexOf(',') >= 0 && s.indexOf('.') >= 0) s = s.replace(/\./g, '').replace(/,/g, '.');
+    else if (s.indexOf(',') >= 0) s = s.replace(/,/g, '.');
+    var n = parseFloat(s);
+    return isNaN(n) ? 0 : n;
+  }
+
+  function minByUrlForGroup_(operacao, suboperacao) {
+    var map = {};
+    (listRouteUrlMinPercents() || []).forEach(function(item){
+      if (normText_(item.operacao) !== normText_(operacao)) return;
+      if (normText_(item.suboperacao) !== normText_(suboperacao)) return;
+      var normalized = normUrlStrict_(item.url || '');
+      if (!normalized) return;
+      map[normalized] = Math.max(0, toNumber_(item.minPercent));
+    });
+    return map;
+  }
+
+  var requestedPessoa = String(params.pessoa || '').trim();
+  var requestedOp = String(params.operacao || '').trim();
+  var requestedSub = String(params.suboperacao || '').trim();
+  if (!requestedOp || !requestedSub) {
+    return { ok: false, message: 'Selecione Operação e Suboperação para carregar URLs da rota.', rows: [], diagnostics: { operacao: requestedOp, suboperacao: requestedSub } };
+  }
+
+  var requestedOpNorm = normText_(requestedOp);
+  var requestedSubNorm = normText_(requestedSub);
+  var routeConfig = null;
+  (listRouteApiConfigs() || []).some(function(rc){
+    var sameOp = normText_(rc.operacao) === requestedOpNorm;
+    var sameSub = normText_(rc.suboperacao) === requestedSubNorm;
+    if (!sameOp || !sameSub) return false;
+    routeConfig = rc;
+    return true;
+  });
+
+  if (!routeConfig) {
+    return {
+      ok: false,
+      message: 'Não existe configuração de rota salva para esta Operação/Suboperação.',
+      rows: [],
+      diagnostics: { operacao: requestedOp, suboperacao: requestedSub, routeConfigFound: false }
+    };
+  }
+
+  if (!routeConfig.empresaId || !routeConfig.dominioId || !routeConfig.slugRota) {
+    return {
+      ok: false,
+      message: 'Configuração de rota incompleta (Empresa ID, Domínio ID ou Slug).',
+      rows: [],
+      diagnostics: { operacao: requestedOp, suboperacao: requestedSub, routeConfigFound: true }
+    };
+  }
+
+  var cfgRows = (getConfig().rows || []).filter(function(r){
+    if (normText_(r.operacao) !== requestedOpNorm) return false;
+    if (normText_(r.suboperacao) !== requestedSubNorm) return false;
+    if (requestedPessoa && String(r.pessoa || '').trim() !== requestedPessoa) return false;
+    return true;
+  });
+
+  var urlToPages = {};
+  var pagesSet = {};
+  cfgRows.forEach(function(entry){
+    var pageName = String(entry.pagina || '').trim();
+    var parteName = String(entry.parte || '').trim().toUpperCase();
+    if (!pageName || !parteName) return;
+    pagesSet[pageName] = true;
+
+    if (parteName === 'P1') {
+      (entry.urls || []).forEach(function(u){
+        var normalized = normUrlStrict_(u);
+        if (!normalized) return;
+        if (!urlToPages[normalized]) urlToPages[normalized] = {};
+        urlToPages[normalized][pageName] = true;
+      });
+    }
+  });
+
+  var startDate = params.startDate;
+  var endDate = params.endDate;
+  if (!startDate && !endDate) {
+    var today = todayIso_();
+    startDate = today;
+    endDate = today;
+  } else if (startDate && !endDate) {
+    endDate = startDate;
+  } else if (!startDate && endDate) {
+    startDate = endDate;
+  }
+
+  var cpcCorrigidoByPage = {};
+  var selectedPages = Object.keys(pagesSet);
+
+  if (requestedPessoa && selectedPages.length) {
+    var compare = (getDashboardData({
+      pessoa: requestedPessoa,
+      operacao: requestedOp,
+      suboperacao: requestedSub,
+      paginasSelecionadas: selectedPages,
+      startDate: startDate,
+      endDate: endDate,
+      granularity: 'last3h'
+    }).compare || []);
+    compare.forEach(function(row){
+      cpcCorrigidoByPage[String(row.page || '').trim()] = toNumber_(row.cpcCorrigido || 0);
+    });
+  }
+
+  Object.keys(pagesSet).forEach(function(pageName){
+    if (!cpcCorrigidoByPage.hasOwnProperty(pageName)) cpcCorrigidoByPage[pageName] = 0;
+  });
+
+  var suggestedByUrl = {};
+  var minByUrl = minByUrlForGroup_(requestedOp, requestedSub);
+  var distPreview = calculateCpcDistribution({ operacao: requestedOp, suboperacao: requestedSub });
+  var distGroups = (distPreview && distPreview.groups) ? distPreview.groups : [];
+  distGroups.forEach(function(group){
+    (group.urls || []).forEach(function(item){
+      var normalizedUrl = normUrlStrict_(item.urlP1 || '');
+      if (!normalizedUrl) return;
+      suggestedByUrl[normalizedUrl] = {
+        percentualSugerido: toNumber_(item.percentualSugerido || 0),
+        eligible: !!item.eligible,
+        minPercent: Math.max(0, toNumber_(item.minPercent || 0))
+      };
+    });
+  });
+
+  var routeResponse = fetchRouteSnapshot_(routeConfig);
+  if (!routeResponse || !routeResponse.ok) {
+    return {
+      ok: false,
+      message: 'Falha ao consultar a API de rotas.',
+      rows: [],
+      diagnostics: {
+        operacao: requestedOp,
+        suboperacao: requestedSub,
+        routeConfigFound: true,
+        httpCode: routeResponse ? routeResponse.code : 0,
+        routeResponseOk: !!(routeResponse && routeResponse.ok)
+      }
+    };
+  }
+
+  var routeLinks = (((routeResponse.body || {}).data || {}).links || []);
+  var rows = routeLinks.map(function(link){
+    var normalized = normUrlStrict_(link.url || link.link || link.destination_url || '');
+    if (!normalized) return null;
+    var mappedPages = Object.keys(urlToPages[normalized] || {});
+    var pageName = mappedPages.length ? mappedPages[0] : '';
+    var cpcCorrigido = 0;
+    if (mappedPages.length) {
+      cpcCorrigido = mappedPages.reduce(function(max, page){
+        return Math.max(max, cpcCorrigidoByPage[page] || 0);
+      }, 0);
+      pageName = mappedPages.length > 1 ? mappedPages.join(' | ') : mappedPages[0];
+    }
+    var suggested = suggestedByUrl[normalized] || { percentualSugerido: 0, eligible: false };
+    return {
+      url: normalized,
+      percentualAtual: parseRoutePercent_(link.percentage || link.percentual || 0),
+      pagina: pageName,
+      cpcCorrigido: cpcCorrigido,
+      percentualSugerido: suggested.eligible ? suggested.percentualSugerido : 0,
+      minPercent: minByUrl.hasOwnProperty(normalized) ? minByUrl[normalized] : (suggested.minPercent || 0),
+      eligible: suggested.eligible
+    };
+  }).filter(function(row){ return !!row; });
+
+  return {
+    ok: true,
+    message: rows.length ? '' : 'A API respondeu, mas não retornou links para esta rota.',
+    rows: rows,
+    diagnostics: {
+      operacao: requestedOp,
+      suboperacao: requestedSub,
+      routeConfigFound: true,
+      routeLinksCount: rows.length,
+      pagesMappedCount: Object.keys(cpcCorrigidoByPage).length
+    }
+  };
+}
+
+function calculateNormalizedSoftmaxDistribution(urls, alpha) {
+  var safeAlpha = isFinite(alpha) ? Number(alpha) : DISTRIBUTION_SOFTMAX_ALPHA;
+  if (!isFinite(safeAlpha) || safeAlpha <= 0) safeAlpha = DISTRIBUTION_SOFTMAX_ALPHA;
+
+  var items = (urls || []).map(function(u, idx){
+    var cpc = toNumber_(u.cpcCorrigido);
+    var minP = Math.max(0, toNumber_(u.minPercent));
+    var maxP = Math.min(100, toNumber_(u.maxPercent) || 100);
+    if (maxP < minP) maxP = minP;
+    return {
+      index: idx,
+      url: u.url,
+      cpcCorrigido: cpc,
+      eligible: !!u.eligible && isFinite(cpc) && cpc > 0,
+      minPercent: minP,
+      maxPercent: maxP,
+      score: 0,
+      weight: 0,
+      softmaxPercent: 0,
+      finalPercent: 0
+    };
+  });
+
+  var eligible = items.filter(function(i){ return i.eligible; });
+  if (!eligible.length) return items;
+
+  var bestCpc = eligible.reduce(function(max, i){ return Math.max(max, i.cpcCorrigido); }, 0);
+  if (!(bestCpc > 0)) return items;
+
+  eligible.forEach(function(i){ i.score = i.cpcCorrigido / bestCpc; });
+
+  var maxScore = eligible.reduce(function(max, i){ return Math.max(max, i.score); }, -Infinity);
+  eligible.forEach(function(i){ i.weight = Math.exp((i.score - maxScore) * safeAlpha); });
+
+  var weightSum = eligible.reduce(function(sum, i){ return sum + i.weight; }, 0);
+  if (!(weightSum > 0)) {
+    var uniform = 100 / eligible.length;
+    eligible.forEach(function(i){ i.softmaxPercent = uniform; });
+  } else {
+    eligible.forEach(function(i){ i.softmaxPercent = (i.weight / weightSum) * 100; });
+  }
+
+  // Regra de mínimo como piso (não deve interferir quando softmax já é maior que o mínimo).
+  // Apenas URLs com softmax abaixo do mínimo são travadas no mínimo; o restante é reescalado.
+  eligible.forEach(function(i){
+    i.finalPercent = i.softmaxPercent;
+    i.lockedByMin = false;
+  });
+
+  var guard = 0;
+  while (guard < 20) {
+    guard++;
+    var fixedSum = 0;
+    var open = [];
+    eligible.forEach(function(i){
+      if (i.lockedByMin) fixedSum += i.finalPercent;
+      else open.push(i);
+    });
+
+    var remaining = Math.max(0, 100 - fixedSum);
+    var openSoftmaxSum = open.reduce(function(sum, i){ return sum + i.softmaxPercent; }, 0);
+    open.forEach(function(i){
+      i.finalPercent = openSoftmaxSum > 0 ? (i.softmaxPercent / openSoftmaxSum) * remaining : 0;
+    });
+
+    var changed = false;
+    open.forEach(function(i){
+      if (i.finalPercent < i.minPercent) {
+        i.finalPercent = i.minPercent;
+        i.lockedByMin = true;
+        changed = true;
+      }
+    });
+    if (!changed) break;
+  }
+
+  // Se soma dos mínimos for > 100, limita para 100 proporcionalmente.
+  var finalSumPreCap = eligible.reduce(function(sum, i){ return sum + i.finalPercent; }, 0);
+  if (finalSumPreCap > 100 && finalSumPreCap > 0) {
+    var capFactor = 100 / finalSumPreCap;
+    eligible.forEach(function(i){ i.finalPercent = i.finalPercent * capFactor; });
+  }
+
+  // Aplica máximo após piso.
+  eligible.forEach(function(i){
+    i.finalPercent = Math.min(i.maxPercent, i.finalPercent);
+    if (i.finalPercent < 0) i.finalPercent = 0;
+  });
+
+  // Renormaliza para 100 antes de arredondar.
+  var normalizedSum = eligible.reduce(function(sum, i){ return sum + i.finalPercent; }, 0);
+  if (normalizedSum > 0) {
+    eligible.forEach(function(i){ i.finalPercent = (i.finalPercent / normalizedSum) * 100; });
+  }
+
+  // Inteiros que fecham 100 (maiores restos recebem +1).
+  var intBaseSum = 0;
+  eligible.forEach(function(i){
+    var floored = Math.floor(i.finalPercent);
+    i._intBase = floored;
+    i._remainder = i.finalPercent - floored;
+    intBaseSum += floored;
+  });
+  var toDistribute = 100 - intBaseSum;
+  if (toDistribute > 0) {
+    var ranked = eligible.slice().sort(function(a, b){ return b._remainder - a._remainder; });
+    for (var k = 0; k < ranked.length && toDistribute > 0; k++, toDistribute--) ranked[k]._intBase += 1;
+  } else if (toDistribute < 0) {
+    var rankedDesc = eligible.slice().sort(function(a, b){ return a._remainder - b._remainder; });
+    for (var j = 0; j < rankedDesc.length && toDistribute < 0; j++) {
+      if (rankedDesc[j]._intBase > 0) {
+        rankedDesc[j]._intBase -= 1;
+        toDistribute++;
+      }
+    }
+  }
+  eligible.forEach(function(i){
+    i.finalPercent = i._intBase;
+    delete i._intBase;
+    delete i._remainder;
+    delete i.lockedByMin;
+  });
+
+  return items;
+}
+
 function calculateCpcDistribution(params) {
   params = params || {};
 
@@ -1171,6 +1702,14 @@ function calculateCpcDistribution(params) {
 
   var routeByKey = {};
   var groupLabelByKey = {};
+  var routeUrlMinMapByKey = {};
+  (listRouteUrlMinPercents() || []).forEach(function(item){
+    var key = keyFor_(item.operacao, item.suboperacao);
+    if (!routeUrlMinMapByKey[key]) routeUrlMinMapByKey[key] = {};
+    var normalized = normUrlStrict_(item.url || '');
+    if (!normalized) return;
+    routeUrlMinMapByKey[key][normalized] = Math.max(0, toNumber_(item.minPercent));
+  });
   routeConfigs.forEach(function(rc){
     var key = keyFor_(rc.operacao, rc.suboperacao);
     routeByKey[key] = rc;
@@ -1290,6 +1829,8 @@ function calculateCpcDistribution(params) {
   var headers = data[0] || [];
   var idx = getHeaderIndexMap_(headers);
   var col = {
+    date: idx[HEADER_MAP.date],
+    hour: idx[HEADER_MAP.hour],
     url: idx[HEADER_MAP.url],
     impressions: idx[HEADER_MAP.impressions],
     clicks: idx[HEADER_MAP.clicks],
@@ -1298,7 +1839,25 @@ function calculateCpcDistribution(params) {
     coverage: idx[HEADER_MAP.coverage]
   };
 
+  var maxHourMs = 0;
   data.slice(1).forEach(function(row){
+    var d = parseDate_(row[col.date]);
+    if (!d) return;
+    var h = parseInt(row[col.hour], 10) || 0;
+    var ms = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0).getTime();
+    if (ms > maxHourMs) maxHourMs = ms;
+  });
+  var cutoffMs = maxHourMs > 0 ? (maxHourMs - (3 * 60 * 60 * 1000)) : null;
+
+  data.slice(1).forEach(function(row){
+    if (cutoffMs != null) {
+      var d = parseDate_(row[col.date]);
+      if (!d) return;
+      var h = parseInt(row[col.hour], 10) || 0;
+      var ms = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0).getTime();
+      if (ms < cutoffMs) return;
+    }
+
     var normalizedUrl = normUrlStrict_(row[col.url] || '');
     if (!normalizedUrl) return;
     Object.keys(pageMetricsByGroup).forEach(function(groupKey){
@@ -1319,9 +1878,12 @@ function calculateCpcDistribution(params) {
   });
 
   var resultGroups = [];
+  var persistedDiagMap = loadDistributionDiagnosisStateMap_();
+  var diagStateUpdates = {};
   Object.keys(groupsMap).forEach(function(groupKey){
     var group = groupsMap[groupKey];
     var routeCfg = routeByKey[groupKey] || null;
+    var routeUrlMinMap = routeUrlMinMapByKey[groupKey] || {};
     var routeUrlsSet = routeUrlsByGroup[groupKey] || {};
     var localUrlsSet = localUrlsByGroup[groupKey] || {};
     var localUrlPageMap = localUrlPageByGroup[groupKey] || {};
@@ -1335,65 +1897,138 @@ function calculateCpcDistribution(params) {
       var correctedClicks = m.clicks + Math.ceil(Math.max(0, perdaUsuario));
       var cpcCorrigido = correctedClicks > 0 ? (m.revenue / correctedClicks) : 0;
 
-      var reasons = [];
-      if (!localUrlsSet[url]) reasons.push('URL existe na rota, mas não existe na suboperação local.');
-      if (!routeUrlsSet[url]) reasons.push('URL existe na suboperação local, mas não existe na rota.');
-      if (!pageName) reasons.push('URL sem Página de Queda (P1) correspondente na suboperação.');
-      if (duplicateUrlWarningsByGroup[groupKey] && duplicateUrlWarningsByGroup[groupKey][url]) reasons.push('URL duplicada em mais de uma Página de Queda P1 na suboperação.');
-      if (!routeCfg) reasons.push('Sem configuração de rota/API para Operação + Suboperação');
-      else if (!routeCfg.automacaoAtiva) reasons.push('Automação inativa para Operação + Suboperação');
-      if (m.requests > 50 && m.revenue <= 0) reasons.push('Mais de 50 solicitações e receita zero');
-      if (!isFinite(cpcCorrigido) || cpcCorrigido <= 0) reasons.push('CPC Corrigido inválido/zerado');
+      var reasonsEstruturais = [];
+      if (!localUrlsSet[url]) reasonsEstruturais.push('URL existe na rota, mas não existe na suboperação local.');
+      if (!routeUrlsSet[url]) reasonsEstruturais.push('URL existe na suboperação local, mas não existe na rota.');
+      if (!pageName) reasonsEstruturais.push('URL sem Página de Queda (P1) correspondente na suboperação.');
+      if (duplicateUrlWarningsByGroup[groupKey] && duplicateUrlWarningsByGroup[groupKey][url]) reasonsEstruturais.push('URL duplicada em mais de uma Página de Queda P1 na suboperação.');
+      if (!routeCfg) reasonsEstruturais.push('Sem configuração de rota/API para Operação + Suboperação');
+      else if (!routeCfg.automacaoAtiva) reasonsEstruturais.push('Automação inativa para Operação + Suboperação');
 
       return {
         operacao: group.operacao,
         suboperacao: group.suboperacao,
         urlP1: url,
+        inRouteApi: !!routeUrlsSet[url],
         pagina: pageName,
         requests: m.requests,
         revenue: m.revenue,
         cpcCorrigido: cpcCorrigido,
         routeConfig: routeCfg,
-        eligible: reasons.length === 0,
-        exclusionReasons: reasons,
+        reasonsEstruturais: reasonsEstruturais,
+        diagnosticoStatus: 'OK',
+        diagnosticoMensagem: '',
+        shouldAlert: false,
+        shouldAct: false,
+        contadorPersistencia: 0,
+        percentualReferencia: 0,
+        requestsEsperados: 0,
+        eligibleEstrutural: reasonsEstruturais.length === 0,
+        eligibleOperacional: true,
+        eligible: reasonsEstruturais.length === 0,
+        exclusionReasons: reasonsEstruturais.slice(),
+        minPercent: routeUrlMinMap.hasOwnProperty(url) ? routeUrlMinMap[url] : (routeCfg ? Math.max(0, toNumber_(routeCfg.minPercent)) : 0),
         percentualSugerido: 0,
         percentualAtualRota: routeCurrentPct.hasOwnProperty(url) ? routeCurrentPct[url] : null,
         diferencaPercentual: null
       };
     });
 
-    var eligible = candidates.filter(function(c){ return c.eligible; });
-    if (!eligible.length) {
-      candidates.forEach(function(c){ c.percentualSugerido = 0; });
-    } else if (eligible.length === 1) {
-      eligible[0].percentualSugerido = 100;
-    } else {
-      var totalCpc = eligible.reduce(function(acc, c){ return acc + Math.max(0, c.cpcCorrigido); }, 0);
-      if (totalCpc <= 0) {
-        eligible.forEach(function(c){ c.percentualSugerido = 0; c.exclusionReasons.push('Divisão por zero evitada (CPC total).'); c.eligible = false; });
-      } else {
-        eligible.forEach(function(c){
-          var raw = (Math.max(0, c.cpcCorrigido) / totalCpc) * 100;
-          var minP = c.routeConfig ? Math.max(0, toNumber_(c.routeConfig.minPercent)) : 0;
-          var maxP = c.routeConfig ? Math.min(100, toNumber_(c.routeConfig.maxPercent) || 100) : 100;
-          if (maxP < minP) maxP = minP;
-          c.percentualSugerido = Math.min(maxP, Math.max(minP, raw));
-        });
-        var sum = eligible.reduce(function(acc, c){ return acc + c.percentualSugerido; }, 0);
-        if (sum > 0) eligible.forEach(function(c){ c.percentualSugerido = (c.percentualSugerido / sum) * 100; });
-      }
+    function applySoftmaxForCandidates_() {
+      var softmaxInput = candidates.map(function(c){
+        var minP = c.routeConfig ? Math.max(0, toNumber_(c.routeConfig.minPercent)) : 0;
+        var maxP = c.routeConfig ? Math.min(100, toNumber_(c.routeConfig.maxPercent) || 100) : 100;
+        if (maxP < minP) maxP = minP;
+        return {
+          url: c.urlP1,
+          cpcCorrigido: c.cpcCorrigido,
+          minPercent: c.minPercent != null ? c.minPercent : minP,
+          maxPercent: maxP,
+          eligible: c.eligible
+        };
+      });
+
+      var softmaxResults = calculateNormalizedSoftmaxDistribution(softmaxInput, DISTRIBUTION_SOFTMAX_ALPHA);
+      var softmaxByUrl = {};
+      softmaxResults.forEach(function(r){
+        var normalizedUrl = normUrlStrict_(r.url || '');
+        if (!normalizedUrl) return;
+        softmaxByUrl[normalizedUrl] = r;
+      });
+
+      candidates.forEach(function(c){
+        var normalizedUrl = normUrlStrict_(c.urlP1 || '');
+        var result = normalizedUrl ? softmaxByUrl[normalizedUrl] : null;
+        c.percentualSugerido = result ? result.finalPercent : 0;
+        c.minPercent = result ? result.minPercent : c.minPercent;
+      });
     }
+
+    applySoftmaxForCandidates_();
+
+    var groupContext = {
+      requestsTotaisGrupo: candidates.reduce(function(sum, c){ return sum + toNumber_(c.requests); }, 0),
+      urlsComPercentualMaiorQueZero: candidates.filter(function(c){
+        var p = c.percentualAtualRota != null ? toNumber_(c.percentualAtualRota) : toNumber_(c.percentualSugerido);
+        return p > 0;
+      }).length,
+      urlsComRequestsMaiorQueZero: candidates.filter(function(c){ return toNumber_(c.requests) > 0; }).length
+    };
+
+    candidates.forEach(function(c){
+      var diagKey = makeDiagStateKey_(c.operacao, c.suboperacao, c.urlP1);
+      var prevState = persistedDiagMap[diagKey] || null;
+      var diagnosis = buildOperationalDiagnosis_(c, groupContext, prevState);
+      c.diagnosticoStatus = diagnosis.status;
+      c.diagnosticoMensagem = diagnosis.mensagem;
+      c.shouldAlert = diagnosis.shouldAlert;
+      c.shouldAct = diagnosis.shouldAct;
+      c.contadorPersistencia = diagnosis.contadorPersistencia;
+      c.percentualReferencia = diagnosis.percentualReferencia;
+      c.requestsEsperados = diagnosis.requestsEsperados;
+      c.eligibleOperacional = !c.shouldAct;
+      c.eligible = !!c.eligibleEstrutural && !!c.eligibleOperacional;
+      c.exclusionReasons = c.reasonsEstruturais.slice();
+      if (!c.eligibleOperacional && diagnosis.status === 'PROBLEMA_CONFIRMADO') {
+        c.exclusionReasons.push('Problema operacional confirmado por persistência: ' + c.diagnosticoMensagem);
+      }
+
+      diagStateUpdates[diagKey] = {
+        key: diagKey,
+        operacao: c.operacao,
+        suboperacao: c.suboperacao,
+        urlP1: c.urlP1,
+        ultimoStatus: c.diagnosticoStatus,
+        ultimoStatusBase: diagnosis.statusBase,
+        contadorConsecutivo: c.contadorPersistencia,
+        ultimaOcorrencia: new Date()
+      };
+    });
+
+    // Recalcula o sugerido após o diagnóstico final de elegibilidade.
+    applySoftmaxForCandidates_();
+
+    candidates.forEach(function(c){
+      var minP = c.routeConfig ? Math.max(0, toNumber_(c.routeConfig.minPercent)) : 0;
+      if (c.minPercent == null) c.minPercent = minP;
+    });
 
     candidates.forEach(function(c){
       if (c.percentualAtualRota != null) c.diferencaPercentual = c.percentualSugerido - c.percentualAtualRota;
     });
 
     var groupWarnings = (routeFetchWarnings[groupKey] || []).slice();
-    candidates.forEach(function(c){ if (!c.eligible) groupWarnings.push(c.urlP1 + ': ' + c.exclusionReasons.join(', ')); });
+    candidates.forEach(function(c){
+      if (!c.eligibleEstrutural) groupWarnings.push(c.urlP1 + ': ' + c.reasonsEstruturais.join(', '));
+      else if (c.shouldAlert) groupWarnings.push(c.urlP1 + ': ' + c.diagnosticoMensagem);
+    });
 
     resultGroups.push({
       operacao: group.operacao,
       suboperacao: group.suboperacao,
+      requestsTotaisGrupo: groupContext.requestsTotaisGrupo,
+      urlsComPercentualMaiorQueZero: groupContext.urlsComPercentualMaiorQueZero,
+      urlsComRequestsMaiorQueZero: groupContext.urlsComRequestsMaiorQueZero,
       urls: candidates,
       avisos: groupWarnings,
       ultimaSincronizacao: routeCfg ? (routeCfg.ultimaSincronizacao || '') : ''
@@ -1415,6 +2050,7 @@ function calculateCpcDistribution(params) {
     gruposGerados: resultGroups.length
   };
 
+  saveDistributionDiagnosisStateMap_(diagStateUpdates);
   return { groups: resultGroups, generatedAt: new Date(), diagnostics: diagnostics };
 }
 
@@ -1546,6 +2182,15 @@ function syncCpcDistributionNow(params) {
   var warnings = [];
 
   distribution.groups.forEach(function(group){
+    (group.urls || []).forEach(function(item){
+      if (item && item.shouldAlert) {
+        warnings.push([new Date(), group.operacao, group.suboperacao, item.urlP1 || '', item.diagnosticoStatus || 'ALERTA_DIAGNOSTICO', item.diagnosticoMensagem || 'Suspeita operacional identificada.']);
+      }
+      if (item && item.diagnosticoStatus === 'PROBLEMA_CONFIRMADO') {
+        history.push(buildHistoryRow_(item, item.routeConfig || null, item.percentualSugerido, '', 'problema_confirmado', item.diagnosticoMensagem || 'Problema confirmado por persistência.'));
+      }
+    });
+
     var routeBuckets = {};
     (group.urls || []).forEach(function(item){
       var cfg = item.routeConfig;
